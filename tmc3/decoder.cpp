@@ -47,10 +47,13 @@
 #include "geometry_octree.h"
 #include "geometry_predictive.h"
 #include "hls.h"
+#include "pointset_processing.h"
 #include "io_hls.h"
 #include "io_tlv.h"
 #include "pcc_chrono.h"
 #include "osspecific.h"
+#include "BitReader.h"
+#include "ari.h"
 
 namespace pcc {
 
@@ -143,8 +146,91 @@ PCCTMC3Decoder3::outputCurrentCloud(PCCTMC3Decoder3::Callbacks* callback)
 {
   if (_suppressOutput)
     return;
-
-  std::swap(_outCloud.cloud, _accumCloud);
+  PCCPointSet3 m_pointCloudReconE = _accumCloud;
+  int K = int(lut1.size() > 0) + lut2.size();
+  if (lut1.size() > 0) {
+    bool fastRecolor = true;
+    int L =
+      std::ceil(std::log(1 / double(_sps->seqGeomScale)) / std::log(2)) - 1;
+    double s = 1 / double(_sps->seqGeomScale) / std::pow(2, L);
+    std::vector<int> neighs1 =
+      get_neighbours(m_pointCloudReconE, _sps->seq_num_neighbors_for_1st_prior);
+    robin_hood::unordered_map<int, int> recon_lut1_backup;
+    if (s < 2) {
+      std::vector<int> num_child, num_childs;
+      tie(num_child, num_childs) = get_num_childs(m_pointCloudReconE, s);
+      std::vector<robin_hood::unordered_map<int, int>> recon_lut1 =
+        reconLUT1(m_pointCloudReconE, s, lut1, neighs1, num_childs);
+      m_pointCloudReconE = PUM1plus(
+        m_pointCloudReconE, s, recon_lut1, neighs1, res1, num_child,
+        num_childs, fastRecolor);
+    } else {
+      robin_hood::unordered_map<int, int> recon_lut1 =
+        reconLUT2(m_pointCloudReconE, lut1[6], neighs1);
+      recon_lut1_backup = recon_lut1;
+      m_pointCloudReconE =
+        PUM2plus(m_pointCloudReconE, recon_lut1, neighs1, res1, fastRecolor);
+    }
+    robin_hood::unordered_map<int, int> recon_lut2;
+    int K1 = std::min(L + 1 - K, _sps->seq_max_num_last_prior_reused);
+    if (lut2.size()) {
+      for (int k = 1; k < K; k++) {
+        std::vector<int> neighs2 = get_neighbours(m_pointCloudReconE, 6);
+        recon_lut2 = reconLUT2(m_pointCloudReconE, lut2[K - 1 - k], neighs2);
+        m_pointCloudReconE =
+          PUM2(m_pointCloudReconE, recon_lut2, neighs2, fastRecolor);
+      }
+      for (int k = 0; k < K1; k++) {
+        std::vector<int> neighs = get_neighbours(m_pointCloudReconE, 6);
+        m_pointCloudReconE =
+          PUM2(m_pointCloudReconE, recon_lut2, neighs, fastRecolor);
+      }
+    } else {
+      if (s == 2 && K1 > 0) {
+        for (int k = 0; k < K1; k++) {
+          std::vector<int> neighs =
+            get_neighbours(m_pointCloudReconE, _sps->seq_num_neighbors_for_1st_prior);
+          m_pointCloudReconE =
+            PUM2(m_pointCloudReconE, recon_lut1_backup, neighs, fastRecolor);
+        }
+      }
+    }
+    if (L + 1 - K - K1 > 0) {
+      for (int i = 0; i < m_pointCloudReconE.getPointCount(); i++) {
+        m_pointCloudReconE[i] =
+          m_pointCloudReconE[i] * (1 << (L + 1 - K - K1));
+      }
+    }
+    int idx = 0;
+    for (int i = 0; i < m_pointCloudReconE.getPointCount(); i++) {
+      m_pointCloudReconE[idx] = m_pointCloudReconE[i];
+      if (fastRecolor) {
+        if (m_pointCloudReconE.hasColors()) {
+          m_pointCloudReconE.setColor(idx, m_pointCloudReconE.getColor(i));
+        }
+        if (m_pointCloudReconE.hasReflectances()) {
+          m_pointCloudReconE.setReflectance(
+            idx, m_pointCloudReconE.getReflectance(i));
+        }
+      }
+      idx += 1;
+    }
+    m_pointCloudReconE.resize(idx);
+    //if (!fastRecolor) {
+    //  //params->recolour.numNeighboursFwd = 1;  // changed for recolour Post
+    //  for (const auto& attr_sps : _sps->attributeSets) {
+    //    // No need for Bwd? It may be bad for the recolour when the reference point cloud for is the downsampled one.
+    //    //recolourPost(
+    //    recolour(
+    //      attr_sps, _params.recolour, _accumCloud,
+    //      1 / double(_sps->seqGeomScale),
+    //      Vec3<int>{0}, &m_pointCloudReconE); // TODO: params->recolour needed to be encoded or also be specified in the decoder
+    //  }
+    //}
+    lut1.clear();
+    lut2.clear();
+  }
+  std::swap(_outCloud.cloud, m_pointCloudReconE);
 
   // Apply global scaling to output for integer conformance
   // todo: add other output scaling modes
@@ -154,8 +240,9 @@ PCCTMC3Decoder3::outputCurrentCloud(PCCTMC3Decoder3::Callbacks* callback)
 
   callback->onOutputCloud(_outCloud);
 
-  std::swap(_outCloud.cloud, _accumCloud);
+  std::swap(_outCloud.cloud, m_pointCloudReconE);
   _accumCloud.clear();
+  m_pointCloudReconE.clear();
 }
 
 //============================================================================
@@ -181,9 +268,16 @@ PCCTMC3Decoder3::decompress(
   // finished points to the output accumulator
   if (!buf || payloadStartsNewSlice(buf->type)) {
     if (size_t numPoints = _currentPointCloud.getPointCount()) {
-      for (size_t i = 0; i < numPoints; i++)
-        for (int k = 0; k < 3; k++)
-          _currentPointCloud[i][k] += _sliceOrigin[k];
+      if (_sps->seq_max_num_pcs_in_pyramid_minus1 > 0) {
+        for (size_t i = 0; i < numPoints; i++)
+          for (int k = 0; k < 3; k++)
+            _currentPointCloud[i][k] +=
+              _sliceOrigin[k] + _sps->seqBoundingBoxOrigin[k];  //
+      } else {
+        for (size_t i = 0; i < numPoints; i++)
+          for (int k = 0; k < 3; k++)
+            _currentPointCloud[i][k] += _sliceOrigin[k];  //
+      }
       _accumCloud.append(_currentPointCloud);
     }
   }
@@ -273,12 +367,15 @@ PCCTMC3Decoder3::decompress(
   }
 
   case PayloadType::kUserData: parseUserData(*buf); return 0;
+
+  case PayloadType::kLUTData: {
+    return decodeLUT(*buf);
+  }
   }
 
   // todo(df): error, unhandled payload type
   return 1;
 }
-
 //--------------------------------------------------------------------------
 
 void
@@ -466,6 +563,216 @@ PCCTMC3Decoder3::decodeGeometryBrick(const PayloadBuffer& buf)
   auto total_user =
     std::chrono::duration_cast<std::chrono::milliseconds>(clock_user.count());
   std::cout << "positions processing time (user): "
+            << total_user.count() / 1000.0 << " s\n";
+  std::cout << std::endl;
+
+  return 0;
+}
+
+//--------------------------------------------------------------------------
+int
+PCCTMC3Decoder3::decodeLUT(const PayloadBuffer& buf)
+{
+  assert(buf.type == PayloadType::kLUTData);
+  std::cout << "lut+residual bitstream size " << buf.size() << " B\n";
+  pcc::chrono::Stopwatch<pcc::chrono::utime_inc_children_clock> clock_user;
+  clock_user.start();
+
+  auto bs = makeBitReader(buf.begin(), buf.end());
+  int tmp;
+  int L =
+    std::ceil(std::log(1 / double(_sps->seqGeomScale)) / std::log(2)) - 1;
+  int K = std::min(L + 1, _sps->seq_max_num_pcs_in_pyramid_minus1);
+  if (K) {
+    int nL = _sps->seq_num_neighbors_for_1st_prior + 1;
+    int binLen;
+    lut1.resize(7);
+    my_model cmodel;
+    if (nL > 6) {
+      for (int k = 0; k < 3; k++) {
+        bs.readUn(nL, &tmp);
+        binLen = tmp;
+        if (binLen) {
+          std::ofstream hprior;
+          hprior.open("hprior.bin", std::ofstream::binary);
+          for (int i = 0; i < binLen; i++) {
+            bs.readUn(8, &tmp);
+            hprior << char(tmp);
+          }
+          hprior.close();
+          std::ifstream input1("hprior.bin", std::ifstream::binary);
+          std::ofstream output1("hprior.txt", std::ofstream::binary);
+          cmodel.reset(2);
+          decompressAri(input1, output1, cmodel);
+          input1.close();
+          output1.close();
+
+          std::ifstream input2("hprior.txt", std::ifstream::binary);
+          for (;;) {
+            int value = input2.get();
+            if (value >= 0) {
+              lut1[k].push_back(value + 1);
+            } else {
+              break;
+            }
+          }
+          input2.close();
+        }
+      }
+      for (int k = 3; k < 6; k++) {
+        bs.readUn(nL, &tmp);
+        binLen = tmp;
+        if (binLen) {
+          std::ofstream hprior;
+          hprior.open("hprior.bin", std::ofstream::binary);
+          for (int i = 0; i < binLen; i++) {
+            bs.readUn(8, &tmp);
+            hprior << char(tmp);
+          }
+          hprior.close();
+          std::ifstream input1("hprior.bin", std::ifstream::binary);
+          std::ofstream output1("hprior.txt", std::ofstream::binary);
+          cmodel.reset(4);
+          decompressAri(input1, output1, cmodel);
+          input1.close();
+          output1.close();
+
+          std::ifstream input2("hprior.txt", std::ifstream::binary);
+          for (;;) {
+            int value = input2.get();
+            if (value >= 0) {
+              lut1[k].push_back(value + 1);
+            } else {
+              break;
+            }
+          }
+          input2.close();
+        }
+      }
+      bs.readUn(nL, &tmp);
+      binLen = tmp;
+      if (binLen) {
+        std::ofstream hprior;
+        hprior.open("hprior.bin", std::ofstream::binary);
+        for (int i = 0; i < binLen; i++) {
+          bs.readUn(8, &tmp);
+          hprior << char(tmp);
+        }
+        hprior.close();
+        std::ifstream input1("hprior.bin", std::ifstream::binary);
+        std::ofstream output1("hprior.txt", std::ofstream::binary);
+        cmodel.reset(8);
+        decompressAri(input1, output1, cmodel);
+        input1.close();
+        output1.close();
+
+        std::ifstream input2("hprior.txt", std::ifstream::binary);
+        for (;;) {
+          int value = input2.get();
+          if (value >= 0) {
+            lut1[6].push_back(value + 1);
+          } else {
+            break;
+          }
+        }
+        input2.close();
+      }
+    } else {
+      for (int k = 0; k < 3; k++) {
+        bs.readUn(nL, &tmp);
+        lut1[k].resize(tmp);
+        for (int i = 0; i < lut1[k].size(); i++) {
+          bs.readUn(2, &tmp);
+          lut1[k][i] = tmp;
+        }
+      }
+      for (int k = 3; k < 6; k++) {
+        bs.readUn(nL, &tmp);
+        lut1[k].resize(tmp);
+        for (int i = 0; i < lut1[k].size(); i++) {
+          bs.readUn(4, &tmp);
+          lut1[k][i] = tmp;
+        }
+      }
+      bs.readUn(nL, &tmp);
+      lut1[6].resize(tmp);
+      for (int i = 0; i < lut1[6].size(); i++) {
+        bs.readUn(8, &tmp);
+        lut1[6][i] = tmp;
+      }
+    }
+
+    bs.readUn(30, &tmp);
+    binLen = tmp;
+    std::ofstream residual;
+    residual.open("residual.bin", std::ofstream::binary);
+    for (int i = 0; i < binLen; i++) {
+      bs.readUn(8, &tmp);
+      residual << char(tmp);
+    }
+    residual.close();
+    std::ifstream input1("residual.bin", std::ifstream::binary);
+    std::ofstream output1("residual.txt", std::ofstream::binary);
+    cmodel.reset(1);
+    decompressAri(input1, output1, cmodel);
+    input1.close();
+    output1.close();
+
+    std::ifstream input2("residual.txt", std::ifstream::binary);
+    for (;;) {
+      int value = input2.get();
+      if (value >= 0) {
+        res1.push_back(value);
+      } else {
+        break;
+      }
+    }
+    input2.close();
+
+    if (K > 1) {
+      lut2.resize(K - 1);
+      for (int k = 0; k < K - 1; k++) {
+        bs.readUn(6, &tmp);
+        binLen = tmp + 1;
+        std::ofstream hprior;
+        hprior.open("hprior.bin", std::ofstream::binary);
+        for (int i = 0; i < binLen; i++) {
+          bs.readUn(8, &tmp);
+          hprior << char(tmp);
+        }
+        hprior.close();
+        std::ifstream input1("hprior.bin", std::ifstream::binary);
+        std::ofstream output1("hprior.txt", std::ofstream::binary);
+        cmodel.reset(8);
+        decompressAri(input1, output1, cmodel);
+        input1.close();
+        output1.close();
+
+        std::ifstream input2("hprior.txt", std::ifstream::binary);
+        for (;;) {
+          int value = input2.get();
+          if (value >= 0) {
+            lut2[k].push_back(value + 1);
+          } else {
+            break;
+          }
+        }
+        input2.close();
+      }
+    } else {
+      lut2.resize(0);
+    }
+  } else {
+    lut1.resize(0);
+    lut2.resize(0);
+  }
+  bs.byteAlign();
+
+  clock_user.stop();
+
+  auto total_user =
+    std::chrono::duration_cast<std::chrono::milliseconds>(clock_user.count());
+  std::cout << "lut+residual processing time (user): "
             << total_user.count() / 1000.0 << " s\n";
   std::cout << std::endl;
 

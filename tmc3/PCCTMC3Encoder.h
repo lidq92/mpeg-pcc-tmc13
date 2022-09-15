@@ -37,8 +37,10 @@
 
 #include <functional>
 #include <map>
+//#include <unordered_map>
 #include <string>
 #include <vector>
+#include <bitset>
 
 #include "Attribute.h"
 #include "PayloadBuffer.h"
@@ -139,6 +141,15 @@ struct EncoderParams {
   // precision expected for attributes after scaling with predgeom
   // and spherical coordinates
   int attrSphericalMaxLog2;
+
+  //
+  int seq_max_num_pcs_in_pyramid_minus1;
+
+  //
+  int seq_max_num_last_prior_reused;
+
+  //
+  int seq_num_neighbors_for_1st_prior;
 };
 
 //============================================================================
@@ -158,7 +169,8 @@ public:
     const PCCPointSet3& inputPointCloud,
     EncoderParams* params,
     Callbacks*,
-    CloudFrame* reconstructedCloud = nullptr);
+    CloudFrame* reconstructedCloud = nullptr,
+    bool postProcessReconCloud = false);
 
   void compressPartition(
     const PCCPointSet3& inputPointCloud,
@@ -175,7 +187,8 @@ private:
 
   void encodeGeometryBrick(const EncoderParams*, PayloadBuffer* buf);
 
-  SrcMappedPointSet quantization(const PCCPointSet3& src);
+  std::vector<SrcMappedPointSet>
+  quantization(const PCCPointSet3& src, int seq_max_num_pcs_in_pyramid_minus1);
 
 private:
   PCCPointSet3 pointCloud;
@@ -231,6 +244,12 @@ private:
   std::unique_ptr<PredGeomContexts> _ctxtMemPredGeom;
   std::vector<AttributeContexts> _ctxtMemAttrs;
   std::vector<int> _ctxtMemAttrSliceIds;
+
+  // LUT + Residuals
+  std::vector<std::vector<int>> lut1;
+  std::vector<std::vector<int>> lut2;
+  std::vector<int> res1;
+  //std::vector<std::vector<int>> res2;
 };
 
 //----------------------------------------------------------------------------

@@ -56,6 +56,7 @@ enum class PayloadType
   kConstantAttribute = 7,
   kGeneralizedAttrParamInventory = 8,
   kUserData = 9,
+  kLUTData = 10,
 };
 
 //============================================================================
@@ -367,6 +368,15 @@ struct SequenceParameterSet {
 
   // A value describing the scaling of the source positions prior to encoding.
   Rational seqGeomScale;
+  
+  // seq_max_num_pcs_in_pyramid_minus1
+  int seq_max_num_pcs_in_pyramid_minus1;
+
+  // seq_max_num_last_prior_reused
+  int seq_max_num_last_prior_reused;
+
+  // seq_num_neighbors_for_1st_prior
+  int seq_num_neighbors_for_1st_prior;
 
   // Indicates that units used to interpret seqGeomScale.
   ScaleUnit seq_geom_scale_unit_flag;
