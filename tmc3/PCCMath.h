@@ -364,6 +364,28 @@ public:
     return (data[0] > rhs[0]);
   }
 
+  //bool operator>=(const Vec3& rhs) const
+  //{
+  //  if (data[0] == rhs[0]) {
+  //    if (data[1] == rhs[1]) {
+  //      return (data[2] >= rhs[2]);
+  //    }
+  //    return (data[1] >= rhs[1]);
+  //  }
+  //  return (data[0] >= rhs[0]);
+  //}
+
+  //bool operator<=(const Vec3& rhs) const
+  //{
+  //  if (data[0] == rhs[0]) {
+  //    if (data[1] == rhs[1]) {
+  //      return (data[2] <= rhs[2]);
+  //    }
+  //    return (data[1] <= rhs[1]);
+  //  }
+  //  return (data[0] <= rhs[0]);
+  //}
+
   bool operator==(const Vec3& rhs) const
   {
     return (data[0] == rhs[0] && data[1] == rhs[1] && data[2] == rhs[2]);
@@ -585,6 +607,22 @@ PCCApproximatelyEqual(
 inline int64_t
 mortonAddr(const int32_t x, const int32_t y, const int32_t z)
 {
+  assert(x >= 0 && y >= 0 && z >= 0);
+  int64_t answer = kMortonCode256X[(x >> 16) & 0xFF]
+    | kMortonCode256Y[(y >> 16) & 0xFF] | kMortonCode256Z[(z >> 16) & 0xFF];
+  answer = answer << 24 | kMortonCode256X[(x >> 8) & 0xFF]
+    | kMortonCode256Y[(y >> 8) & 0xFF] | kMortonCode256Z[(z >> 8) & 0xFF];
+  answer = answer << 24 | kMortonCode256X[x & 0xFF] | kMortonCode256Y[y & 0xFF]
+    | kMortonCode256Z[z & 0xFF];
+  return answer;
+}
+
+inline int64_t
+mortonAddr1(Vec3<int32_t> point)
+{
+  int x = int(point[0]) + 1;
+  int y = int(point[1]) + 1;
+  int z = int(point[2]) + 1;
   assert(x >= 0 && y >= 0 && z >= 0);
   int64_t answer = kMortonCode256X[(x >> 16) & 0xFF]
     | kMortonCode256Y[(y >> 16) & 0xFF] | kMortonCode256Z[(z >> 16) & 0xFF];

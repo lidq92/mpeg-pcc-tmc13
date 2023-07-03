@@ -112,6 +112,18 @@ struct Parameters {
 
   // resort the input points by azimuth angle
   bool sortInputByAzimuth;
+
+  // maxNumPcsInPyramid
+  int maxNumPcsInPyramid;
+
+  //geomCoffAdjustFlag
+  int geomCoffAdjustFlag;
+
+  // maxNumReused
+  int maxNumReused;
+
+  // dist1ForPointClustering
+  int dist1ForPointClustering;
 };
 
 //----------------------------------------------------------------------------
@@ -674,6 +686,22 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "  0: Use srcUnitLength\n"
     " >0: Relative to inputScale")
 
+  ("maxNumPcsInPyramid",
+    params.maxNumPcsInPyramid, 2,
+    "maxNumPcsInPyramid")
+
+  ("geomCoffAdjustFlag",
+    params.geomCoffAdjustFlag, 2,
+    "geomCoffAdjustFlag")
+
+  ("maxNumReused",
+    params.maxNumReused, 2,
+    "maxNumReused")
+
+  ("dist1ForPointClustering",
+    params.dist1ForPointClustering, 2,
+    "dist1ForPointClustering")
+
   (po::Section("Decoder"))
 
   ("skipOctreeLayers",
@@ -757,7 +785,7 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     "Propagate context state between slices")
 
   ("disableAttributeCoding",
-    params.disableAttributeCoding, false,
+    params.disableAttributeCoding, true,
     "Ignore attribute coding configuration")
 
   ("enforceLevelLimits",
@@ -1225,6 +1253,33 @@ ParseParameters(int argc, char* argv[], Parameters& params)
     params.outputUnitLength = params.encoder.srcUnitLength;
   params.encoder.outputFpBits = params.outputFpBits;
   params.decoder.outputFpBits = params.outputFpBits;
+
+  params.decoder.recolour = params.encoder.recolour;
+  //params.decoder.recolour.numNeighboursFwd = 1; // changed for recolour Post
+  params.encoder.maxNumPcsInPyramid = params.maxNumPcsInPyramid;
+  params.encoder.maxNumReused = params.maxNumReused;
+  params.encoder.dist1ForPointClustering = params.dist1ForPointClustering;
+  //
+  //if (params.geomCoffAdjustFlag) {
+  //  auto pq = Rational(1 / params.encoder.seqGeomScale);
+  //  double p = pq.numerator, q = pq.denominator;
+  //  if (q > 1 && params.encoder.seqGeomScale > 0.5) {
+  //    params.encoder.seqGeomScale = (q - std::min(1., q - 1)) / p;
+  //    //if (q <= 3) {
+  //    //  params.encoder.seqGeomScale = 0.5;
+  //    //}
+  //  } else
+  //    params.encoder.seqGeomScale /= 2;
+  //}
+  for (int g = 0; g < params.geomCoffAdjustFlag; g++) {
+    auto pq = Rational(1 / params.encoder.seqGeomScale);
+    double p = pq.numerator, q = pq.denominator;
+    if (q > 1 && params.encoder.seqGeomScale > 0.5) {
+      params.encoder.seqGeomScale = (q - std::min(1., q - 1)) / p;
+    } else {
+      params.encoder.seqGeomScale /= 2;
+    }
+  }
 
   if (!params.isDecoder)
     sanitizeEncoderOpts(params, err);
@@ -1728,11 +1783,15 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
 
   // The reconstructed point cloud
   CloudFrame recon;
+  bool writeReconCloud = params->reconstructedDataPath.empty() ? false : true;
   auto* reconPtr = params->reconstructedDataPath.empty() ? nullptr : &recon;
+  if (params->maxNumPcsInPyramid > 0) { //
+    reconPtr = &recon;
+  }
 
   auto bytestreamLenFrameStart = bytestreamFile.tellp();
 
-  int ret = encoder.compress(pointCloud, &params->encoder, this, reconPtr);
+  int ret = encoder.compress(pointCloud, &params->encoder, this, reconPtr, writeReconCloud);
   if (ret) {
     cout << "Error: can't compress point cloud!" << endl;
     return -1;
@@ -1744,7 +1803,7 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
 
   clock->stop();
 
-  if (reconPtr)
+  if (writeReconCloud)
     writeOutputFrame(params->reconstructedDataPath, {}, recon, recon.cloud);
 
   return 0;
@@ -1898,10 +1957,17 @@ SequenceCodec::writeOutputFrame(
   auto plyScale = outputScale(frame) / (1 << frame.outputFpBits);
   auto plyOrigin = outputOrigin(frame);
   std::string decName{expandNum(postInvScalePath, frameNum)};
-  if (!ply::write(
-        cloud, attrNames, plyScale, plyOrigin, decName,
-        !params->outputBinaryPly)) {
-    cout << "Error: can't open output file!" << endl;
+  if (params->maxNumPcsInPyramid > 0) {
+    if (!ply::write(
+          cloud, attrNames, 1.0, 0.0, decName, !params->outputBinaryPly)) {
+      cout << "Error: can't open output file!" << endl;
+    }
+  } else {
+    if (!ply::write(
+          cloud, attrNames, plyScale, plyOrigin, decName,
+          !params->outputBinaryPly)) {
+      cout << "Error: can't open output file!" << endl;
+    }
   }
 }
 

@@ -39,6 +39,7 @@
 
 #include "PCCPointSet.h"
 #include "hls.h"
+#include "robin_hood.h"
 
 namespace pcc {
 
@@ -105,6 +106,9 @@ SrcMappedPointSet quantizePositionsUniq(
   const Box3<int> clamp,
   const PCCPointSet3& src);
 
+SrcMappedPointSet quantizePositionsUniqWithoutOffset(
+  const float scaleFactor, const Box3<int> clamp, const PCCPointSet3& src);
+
 //============================================================================
 // Quantise the geometry of a point cloud, retaining duplicate points.
 // Points in the @src point cloud are translated by -@offset, then quantised
@@ -155,6 +159,19 @@ bool recolourColour(
   point_t targetToSourceOffset,
   PCCPointSet3& target);
 
+//bool recolourColourPost(
+//  const AttributeDescription& attrDesc,
+//  const RecolourParams& params,
+//  const PCCPointSet3& source,
+//  double sourceToTargetScaleFactor,
+//  point_t targetToSourceOffset,
+//  PCCPointSet3& target);
+
+bool recolourColourPost(
+  const PCCPointSet3& pointCloudOrg,
+  double geomQuanStep,
+  point_t quanOffset,
+  PCCPointSet3& pointCloudRec);
 //============================================================================
 // Determine reflectance attribute values from a reference/source point cloud.
 // For each point of the target p_t:
@@ -176,8 +193,17 @@ bool recolourColour(
 // clouds, is handled according to:
 //    posInTgt = posInSrc * sourceToTargetScaleFactor - targetToSourceOffset
 
+
 bool recolourReflectance(
   const AttributeDescription& desc,
+  const RecolourParams& cfg,
+  const PCCPointSet3& source,
+  double sourceToTargetScaleFactor,
+  point_t targetToSourceOffset,
+  PCCPointSet3& target);
+
+bool recolourReflectancePost(
+  const AttributeDescription& attrDesc,
   const RecolourParams& cfg,
   const PCCPointSet3& source,
   double sourceToTargetScaleFactor,
@@ -192,6 +218,14 @@ bool recolourReflectance(
 //   posInTgt = posInSrc * sourceToTargetScaleFactor - tgtToSrcOffset
 
 int recolour(
+  const AttributeDescription& desc,
+  const RecolourParams& cfg,
+  const PCCPointSet3& source,
+  float sourceToTargetScaleFactor,
+  point_t tgtToSrcOffset,
+  PCCPointSet3* target);
+
+int recolourPost(
   const AttributeDescription& desc,
   const RecolourParams& cfg,
   const PCCPointSet3& source,
@@ -235,6 +269,62 @@ void sortByLaserAngle(
   int end,
   double recipBinWidth,
   Vec3<int32_t> origin = 0);
+
+robin_hood::unordered_map<int, int> occupancy(const PCCPointSet3& Vp);
+
+std::vector<int> get_children1(
+  const PCCPointSet3& Vp,
+  const PCCPointSet3& V,
+  const std::vector<int>& num_child,
+  const std::vector<int>& num_childs,
+  const float s);
+
+std::vector<int> get_children2(const PCCPointSet3& Vp, const PCCPointSet3& V);
+
+std::vector<int> get_neighbours(const PCCPointSet3& Vp, const int dist);
+
+std::vector<std::vector<int>> buildLUT1(
+  const PCCPointSet3& Vp,
+  const PCCPointSet3& V,
+  const float s,
+  const std::vector<int>& varphi,
+  const std::vector<int>& num_child,
+  const std::vector<int>& num_childs);
+
+std::vector<int> buildLUT2(
+  const PCCPointSet3& Vp,
+  const PCCPointSet3& V,
+  const std::vector<int>& uncles);
+
+std::tuple<std::vector<int>, std::vector<int>>
+get_num_childs(const PCCPointSet3& Vd, const float s);
+
+std::vector<robin_hood::unordered_map<int, int>> reconLUT1(
+  const PCCPointSet3& Vd,
+  const float s,
+  const std::vector<std::vector<int>>& lut_values,
+  const std::vector<int>& neighs,
+  const std::vector<int>& num_childs);
+
+robin_hood::unordered_map<int, int> reconLUT2(
+  const PCCPointSet3& Vd,
+  const std::vector<int>& lut_values,
+  const std::vector<int>& neighs);
+
+PCCPointSet3 PUM1(
+  const PCCPointSet3& m_pointCloudQuant,
+  const float s,
+  std::vector<robin_hood::unordered_map<int, int>>& lut,
+  const std::vector<int>& neighs,
+  const std::vector<int>& num_child,
+  const std::vector<int>& num_childs,
+  const bool fastRecolor=true);
+
+PCCPointSet3 PUM2(
+  const PCCPointSet3& m_pointCloudQuant,
+  robin_hood::unordered_map<int, int>& lut,
+  const std::vector<int>& neighs,
+  const bool fastRecolor=true);
 
 //============================================================================
 

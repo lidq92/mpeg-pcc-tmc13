@@ -430,6 +430,10 @@ write(const SequenceParameterSet& sps)
   bs.writeUe(seq_unit_denominator_minus1);
   bs.writeUn(1, sps.seq_geom_scale_unit_flag);
 
+  bs.writeUn(4, sps.maxNumPcsInPyramid);
+  bs.writeUn(4, sps.maxNumReused);
+  bs.writeUn(2, sps.dist1ForPointClustering);
+
   bs.writeUe(sps.global_scale_mul_log2());
   bs.writeUe(sps.global_scale_fp_bits());
   bs.writeUn(sps.global_scale_fp_bits(), sps.global_scale_rem());
@@ -520,6 +524,10 @@ parseSps(const PayloadBuffer& buf)
 
   sps.seqGeomScale.numerator = seq_unit_numerator_minus1 + 1;
   sps.seqGeomScale.denominator = seq_unit_denominator_minus1 + 1;
+
+  bs.readUn(4, &sps.maxNumPcsInPyramid);
+  bs.readUn(4, &sps.maxNumReused);
+  bs.readUn(2, &sps.dist1ForPointClustering);
 
   bs.readUe(&sps.global_scale_mul_log2());
   bs.readUe(&sps.global_scale_fp_bits());
