@@ -39,6 +39,96 @@ namespace pcc {
 
 //=============================================================================
 
+class MotionParameters {
+private:
+  int numFrames;
+  std::vector<std::vector<int>> motionMatrix;
+  std::vector<Vec3<int>> transVec;
+  std::vector<std::pair<int, int>> threshVec;
+  int frameCounter;
+
+public:
+  MotionParameters() : numFrames(0), frameCounter(-1) {}
+  bool EndOfFrames() const { return frameCounter >= numFrames; }
+  void AdvanceFrame() { frameCounter++; }
+  int getFrameCtr() { return frameCounter; }
+  float quantizeParameter(float x)
+  {
+    int scaleFactor = 65536;
+    float y = x * scaleFactor;
+    if (y < 0)
+      return int(y - 0.5) / float(scaleFactor);
+    else
+      return int(y + 0.5) / float(scaleFactor);
+  }
+  void parseFile(std::string fileName, double qs)
+  {
+    if (numFrames)
+      return;
+
+    std::ifstream fin(fileName);
+    float tmp;
+    std::vector<float> out;
+    std::copy(
+      std::istream_iterator<float>(fin), std::istream_iterator<float>(),
+      std::back_inserter(out));
+    numFrames = out.size() / 14;
+    motionMatrix.resize(numFrames);
+    transVec.resize(numFrames);
+    threshVec.resize(numFrames);
+    const int scaleFactor = 65536;
+    auto it = out.begin();
+    for (auto i = 0; i < numFrames; i++) {
+      motionMatrix[i].resize(9);
+      for (int j = 0; j < 9; j++)
+        if (j % 3 == j / 3)
+          motionMatrix[i][j] = std::round((*(it++) - 1) * scaleFactor) + 65536;
+        else
+          motionMatrix[i][j] = std::round((*(it++)) * scaleFactor);
+      for (int j = 0; j < 3; j++)
+        transVec[i][j] = std::round((*(it++)) * qs);
+      threshVec[i].first =
+        std::round((*(it++)) * qs);  // quantizeParameter(*(it++));
+      threshVec[i].second =
+        std::round((*(it++)) * qs);  // quantizeParameter(*(it++));
+    }
+  }
+  void setMotionParams(
+    std::pair<int, int> thresh, std::vector<int> matrix, Vec3<int> trans)
+  {
+    motionMatrix.push_back(matrix);
+    threshVec.push_back(thresh);
+    transVec.push_back(trans);
+  }
+  template<typename T>
+  void getMotionParams(
+    std::pair<int, int>& th, std::vector<T>& mat, Vec3<int>& tr) const
+  {
+    if (frameCounter > threshVec.size()) {
+      std::cout << "Accessing unassigned values\n";
+    }
+    th = threshVec[frameCounter];
+    mat.resize(9);
+    for (auto i = 0; i < 9; i++)
+      mat[i] = motionMatrix[frameCounter][i];
+    tr = transVec[frameCounter];
+  }
+  void updateThresholds(
+    const int frameCounter, const int leftThresh, const int rightTresh)
+  {
+    // todo: use variable instead of array for thresholds
+    if (threshVec.size() > frameCounter)
+      threshVec[frameCounter] = {rightTresh, leftThresh};
+    else if (threshVec.size() == frameCounter) {
+      /* Do nothing - last frame*/
+    } else {
+      throw std::runtime_error(
+        "Check: frameCounter > threshVec.size()");
+    }
+  }
+};
+//=============================================================================
+
 struct QtBtParameters {
   // maximum number of qtbt partitions before performing octree partitioning.
   int maxNumQtBtBeforeOt;
@@ -73,7 +163,13 @@ struct OctreeEncOpts {
   int qpOffsetNodeSizeLog2;
 };
 
-//=============================================================================
+//----------------------------------------------------------------------------
+
+struct TrisoupEncOpts {
+  bool improvedVertexDetermination;
+};
+
+//----------------------------------------------------------------------------
 
 struct PredGeomEncOpts {
   enum SortMode
@@ -91,6 +187,41 @@ struct PredGeomEncOpts {
   // Reciprocal bin width used in azimuthal sorting.
   //  0 => full precision
   float azimuthSortRecipBinWidth;
+
+  int maxPredIdxTested;
+  int radiusThresholdForNewPred;
+};
+
+
+//----------------------------------------------------------------------------
+
+struct InterGeomEncOpts {
+  enum MotionSource
+  {
+    kExternalGMSrc = 0,
+    kInternalLMSGMSrc = 1,
+    kInternalICPGMSrc = 2,
+  } motionSrc;
+
+  enum LPUType
+  {
+    kRoadObjClassfication = 0,
+    kCuboidPartition = 1,
+  } lpuType;
+
+  MotionParameters motionParams;
+	bool useCuboidalRegionsInGMEstimation;
+  bool deriveGMThreshold;
+  float gmThresholdHistScale;
+  int gmThresholdMinZ;
+  int gmThresholdMaxZ;
+  float gmThresholdLeftScale;
+  float gmThresholdRightScale;
+
+  std::vector<int> motion_block_size;
+  int motion_window_size;
+  int th_dist;
+
 };
 
 //=============================================================================

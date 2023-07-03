@@ -400,7 +400,9 @@ Rational::Rational(float val)
 
 Rational::Rational(double val)
 {
-  *this = fromReal(val, 1 << 16);
+  *this = fromReal(
+    val,
+    2147483647);  // maxQ = 1 << 16 cannot handle the situation of val < 1 / (1<<16), ...
 }
 
 //============================================================================

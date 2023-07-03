@@ -47,10 +47,13 @@
 #include "geometry_octree.h"
 #include "geometry_predictive.h"
 #include "hls.h"
+#include "pointset_processing.h"
 #include "io_hls.h"
 #include "io_tlv.h"
 #include "pcc_chrono.h"
 #include "osspecific.h"
+#include "BitReader.h"
+#include "ari.h"
 
 namespace pcc {
 
@@ -74,6 +77,8 @@ PCCTMC3Decoder3::init()
   _spss.clear();
   _gpss.clear();
   _apss.clear();
+
+  geomBits = 0;
 
   _ctxtMemOctreeGeom.reset(new GeometryOctreeContexts);
   _ctxtMemPredGeom.reset(new PredGeomContexts);
@@ -144,7 +149,63 @@ PCCTMC3Decoder3::outputCurrentCloud(PCCTMC3Decoder3::Callbacks* callback)
   if (_suppressOutput)
     return;
 
-  std::swap(_outCloud.cloud, _accumCloud);
+  PCCPointSet3 m_pointCloudReconE = _accumCloud;
+  int K = _sps->seq_max_num_pcs_in_pyramid_minus1;
+  if (K > 0) {
+    bool fastRecolor = true;
+    int L =
+      std::ceil(std::log(1 / double(_sps->seqGeomScale)) / std::log(2)) - 1;
+    double s = 1 / double(_sps->seqGeomScale) / std::pow(2, L);
+    std::vector<int> neighs1 = get_neighbours(
+      m_pointCloudReconE, _params.seq_num_neighbors_for_1st_prior);
+    robin_hood::unordered_map<int, int> recon_lut1 =
+      reconLUT2(m_pointCloudReconE, lut1, neighs1);
+    m_pointCloudReconE =
+      PUM2(m_pointCloudReconE, recon_lut1, neighs1, fastRecolor);
+    robin_hood::unordered_map<int, int> recon_lut2;
+    if (K > 1) {
+      for (int k = 1; k < K; k++) {
+        std::vector<int> neighs2 = get_neighbours(m_pointCloudReconE, 6);
+        recon_lut2 = reconLUT2(m_pointCloudReconE, lut2[K - 1 - k], neighs2);
+        m_pointCloudReconE =
+          PUM2(m_pointCloudReconE, recon_lut2, neighs2, fastRecolor);
+      }
+    }
+    if (L + 1 - K > 0) {
+      for (int i = 0; i < m_pointCloudReconE.getPointCount(); i++) {
+        m_pointCloudReconE[i] = m_pointCloudReconE[i] * (1 << (L + 1 - K));
+      }
+    }
+    int idx = 0;
+    for (int i = 0; i < m_pointCloudReconE.getPointCount(); i++) {
+      m_pointCloudReconE[idx] = m_pointCloudReconE[i];
+      if (fastRecolor) {
+        if (m_pointCloudReconE.hasColors()) {
+          m_pointCloudReconE.setColor(idx, m_pointCloudReconE.getColor(i));
+        }
+        if (m_pointCloudReconE.hasReflectances()) {
+          m_pointCloudReconE.setReflectance(
+            idx, m_pointCloudReconE.getReflectance(i));
+        }
+      }
+      idx += 1;
+    }
+    m_pointCloudReconE.resize(idx);
+    //if (!fastRecolor) {
+    //  //params->recolour.numNeighboursFwd = 1;  // changed for recolour Post
+    //  for (const auto& attr_sps : _sps->attributeSets) {
+    //    // No need for Bwd? It may be bad for the recolour when the reference point cloud for is the downsampled one.
+    //    //recolourPost(
+    //    recolour(
+    //      attr_sps, _params.recolour, _accumCloud,
+    //      1 / double(_sps->seqGeomScale),
+    //      Vec3<int>{0}, &m_pointCloudReconE); // TODO: params->recolour needed to be encoded or also be specified in the decoder
+    //  }
+    //}
+    lut1.clear();
+    lut2.clear();
+  }
+  std::swap(_outCloud.cloud, m_pointCloudReconE);
 
   // Apply global scaling to output for integer conformance
   // todo: add other output scaling modes
@@ -154,8 +215,9 @@ PCCTMC3Decoder3::outputCurrentCloud(PCCTMC3Decoder3::Callbacks* callback)
 
   callback->onOutputCloud(_outCloud);
 
-  std::swap(_outCloud.cloud, _accumCloud);
+  std::swap(_outCloud.cloud, m_pointCloudReconE);
   _accumCloud.clear();
+  m_pointCloudReconE.clear();
 }
 
 //============================================================================
@@ -181,9 +243,16 @@ PCCTMC3Decoder3::decompress(
   // finished points to the output accumulator
   if (!buf || payloadStartsNewSlice(buf->type)) {
     if (size_t numPoints = _currentPointCloud.getPointCount()) {
-      for (size_t i = 0; i < numPoints; i++)
-        for (int k = 0; k < 3; k++)
-          _currentPointCloud[i][k] += _sliceOrigin[k];
+      if (_sps->seq_max_num_pcs_in_pyramid_minus1) {
+        for (size_t i = 0; i < numPoints; i++)
+          for (int k = 0; k < 3; k++)
+            _currentPointCloud[i][k] +=
+              _sliceOrigin[k] + _sps->seqBoundingBoxOrigin[k];  //
+      } else {
+        for (size_t i = 0; i < numPoints; i++)
+          for (int k = 0; k < 3; k++)
+            _currentPointCloud[i][k] += _sliceOrigin[k];  //
+      }
       _accumCloud.append(_currentPointCloud);
     }
   }
@@ -247,6 +316,12 @@ PCCTMC3Decoder3::decompress(
     _attrDecoder.reset();
     // Avoid dropping an actual frame
     _suppressOutput = false;
+
+    if (!attrInterPredParams.getPointCount())
+      attrInterPredParams.referencePointCloud = _currentPointCloud;
+    // save the decoded pointcloud in the reference buffer
+    std::swap(_refPointCloud, _currentPointCloud);
+
     return decodeGeometryBrick(*buf);
 
   case PayloadType::kAttributeBrick: decodeAttributeBrick(*buf); return 0;
@@ -273,6 +348,9 @@ PCCTMC3Decoder3::decompress(
   }
 
   case PayloadType::kUserData: parseUserData(*buf); return 0;
+
+  case PayloadType::kLUTData: decodeLUT(*buf); return 0;
+
   }
 
   // todo(df): error, unhandled payload type
@@ -352,6 +430,8 @@ PCCTMC3Decoder3::decodeGeometryBrick(const PayloadBuffer& buf)
   assert(buf.type == PayloadType::kGeometryBrick);
   std::cout << "positions bitstream size " << buf.size() << " B\n";
 
+  geomBits += 8 * buf.size();
+
   // todo(df): replace with attribute mapping
   bool hasColour = std::any_of(
     _sps->attributeSets.begin(), _sps->attributeSets.end(),
@@ -377,14 +457,27 @@ PCCTMC3Decoder3::decodeGeometryBrick(const PayloadBuffer& buf)
   _sliceId = _gbh.geom_slice_id;
   _sliceOrigin = _gbh.geomBoxOrigin;
 
+  if (_frameCtr == 0) {
+    _refFrameSph.setGlobalMotionEnabled(_gps->globalMotionEnabled);
+  } else if (_firstSliceInFrame) {
+    if (_gps->globalMotionEnabled)
+      _refFrameSph.setMotionParams(
+        _gbh.gm_thresh, _gbh.gm_matrix, _gbh.gm_trans);
+    _refFrameSph.updateFrame(*_gps);
+  }
+
   // sanity check for loss detection
   if (_gbh.entropy_continuation_flag) {
     assert(!_firstSliceInFrame);
     assert(_gbh.prev_slice_id == _prevSliceId);
   } else {
     // forget (reset) all saved context state at boundary
-    _ctxtMemOctreeGeom->reset();
-    _ctxtMemPredGeom->reset();
+    if (
+      !_gps->gof_geom_entropy_continuation_enabled_flag
+      || !_gbh.interPredictionEnabledFlag) {
+      _ctxtMemOctreeGeom->reset();
+      _ctxtMemPredGeom->reset();
+    }
     for (auto& ctxtMem : _ctxtMemAttrs)
       ctxtMem.reset();
   }
@@ -441,22 +534,34 @@ PCCTMC3Decoder3::decodeGeometryBrick(const PayloadBuffer& buf)
   aec.enableBypassStream(_sps->cabac_bypass_stream_enabled_flag);
   aec.start();
 
-  if (_gps->predgeom_enabled_flag)
+  if (_gps->predgeom_enabled_flag) {
+    _refFrameSph.setInterEnabled(_gbh.interPredictionEnabledFlag);
     decodePredictiveGeometry(
-      *_gps, _gbh, _currentPointCloud, &_posSph, *_ctxtMemPredGeom, aec);
-  else if (!_gps->trisoup_enabled_flag) {
+      *_gps, _gbh, _currentPointCloud, &_posSph, _refFrameSph,
+      *_ctxtMemPredGeom, aec);
+  } else if (!_gps->trisoup_enabled_flag) {
     if (!_params.minGeomNodeSizeLog2) {
       decodeGeometryOctree(
-        *_gps, _gbh, _currentPointCloud, *_ctxtMemOctreeGeom, aec);
+        *_gps, _gbh, _currentPointCloud, *_ctxtMemOctreeGeom, aec
+        ,_refPointCloud
+        ,_sps->seqBoundingBoxOrigin
+	  );
     } else {
       decodeGeometryOctreeScalable(
         *_gps, _gbh, _params.minGeomNodeSizeLog2, _currentPointCloud,
-        *_ctxtMemOctreeGeom, aec);
+        *_ctxtMemOctreeGeom, aec
+        ,_refPointCloud
+	  );
     }
   } else {
     decodeGeometryTrisoup(
-      *_gps, _gbh, _currentPointCloud, *_ctxtMemOctreeGeom, aec);
+      *_gps, _gbh, _currentPointCloud, *_ctxtMemOctreeGeom, aec,
+      _refPointCloud, _sps->seqBoundingBoxOrigin);
   }
+
+  if (_gps->interPredictionEnabledFlag)
+    if (_gps->predgeom_enabled_flag)
+      _refFrameSph.insert(_posSph);
 
   // At least the first slice's geometry has been decoded
   _firstSliceInFrame = false;
@@ -467,6 +572,130 @@ PCCTMC3Decoder3::decodeGeometryBrick(const PayloadBuffer& buf)
     std::chrono::duration_cast<std::chrono::milliseconds>(clock_user.count());
   std::cout << "positions processing time (user): "
             << total_user.count() / 1000.0 << " s\n";
+  std::cout << std::endl;
+
+  return 0;
+}
+
+
+//--------------------------------------------------------------------------
+int
+PCCTMC3Decoder3::decodeLUT(const PayloadBuffer& buf)
+{
+  assert(buf.type == PayloadType::kLUTData);
+  std::cout << "lut bitstream size " << buf.size() << " B\n";
+  pcc::chrono::Stopwatch<pcc::chrono::utime_inc_children_clock> clock_user;
+  clock_user.start();
+
+  auto bs = makeBitReader(buf.begin(), buf.end());
+  int tmp;
+  int L =
+    std::ceil(std::log(1 / double(_sps->seqGeomScale)) / std::log(2)) - 1;
+  int K = _sps->seq_max_num_pcs_in_pyramid_minus1;
+  if (K) {
+    //_params.seq_num_neighbors_for_1st_prior = 6;
+    //_params.seq_num_neighbors_for_1st_prior = 18;
+    if (geomBits < 25000) {
+      _params.seq_num_neighbors_for_1st_prior = 6;
+    } else if (geomBits > 200000) {
+      _params.seq_num_neighbors_for_1st_prior = 18;
+    } else {
+      _params.seq_num_neighbors_for_1st_prior = 12;
+    }
+    int nL = _params.seq_num_neighbors_for_1st_prior + 1;
+    int binLen;
+    my_model cmodel;
+    if (nL >= 6) {
+      bs.readUn(nL, &tmp);
+      binLen = tmp;
+      if (binLen) {
+        std::ofstream hprior;
+        hprior.open(_params.folderPath + "hprior.bin", std::ofstream::binary);
+        for (int i = 0; i < binLen; i++) {
+          bs.readUn(8, &tmp);
+          hprior << char(tmp);
+        }
+        hprior.close();
+        std::ifstream input1(
+          _params.folderPath + "hprior.bin", std::ifstream::binary);
+        std::ofstream output1(
+          _params.folderPath + "hprior.txt", std::ofstream::binary);
+        cmodel.reset(8);
+        decompressAri(input1, output1, cmodel);
+        input1.close();
+        output1.close();
+
+        std::ifstream input2(
+          _params.folderPath + "hprior.txt", std::ifstream::binary);
+        for (;;) {
+          int value = input2.get();
+          if (value >= 0) {
+            lut1.push_back(value + 1);
+          } else {
+            break;
+          }
+        }
+        input2.close();
+      }
+    } else {
+      bs.readUn(nL, &tmp);
+      lut1.resize(tmp);
+      for (int i = 0; i < lut1.size(); i++) {
+        bs.readUn(8, &tmp);
+        lut1[i] = tmp;
+      }
+    }
+
+    if (K > 1) {
+      lut2.resize(K - 1);
+      for (int k = 0; k < K - 1; k++) {
+        bs.readUn(6, &tmp);
+        binLen = tmp + 1;
+        std::ofstream hprior;
+        hprior.open(_params.folderPath + "hprior.bin", std::ofstream::binary);
+        for (int i = 0; i < binLen; i++) {
+          bs.readUn(8, &tmp);
+          hprior << char(tmp);
+        }
+        hprior.close();
+        std::ifstream input1(
+          _params.folderPath + "hprior.bin", std::ifstream::binary);
+        std::ofstream output1(
+          _params.folderPath + "hprior.txt", std::ofstream::binary);
+        cmodel.reset(8);
+        decompressAri(input1, output1, cmodel);
+        input1.close();
+        output1.close();
+
+        std::ifstream input2(
+          _params.folderPath + "hprior.txt", std::ifstream::binary);
+        for (;;) {
+          int value = input2.get();
+          if (value >= 0) {
+            lut2[k].push_back(value + 1);
+          } else {
+            break;
+          }
+        }
+        input2.close();
+        remove((_params.folderPath + "hprior.bin").c_str());
+        remove((_params.folderPath + "hprior.txt").c_str());
+      }
+    } else {
+      lut2.resize(0);
+    }
+  } else {
+    lut1.resize(0);
+    lut2.resize(0);
+  }
+  bs.byteAlign();
+
+  clock_user.stop();
+
+  auto total_user =
+    std::chrono::duration_cast<std::chrono::milliseconds>(clock_user.count());
+  std::cout << "lut processing time (user): " << total_user.count() / 1000.0
+            << " s\n";
   std::cout << std::endl;
 
   return 0;
@@ -510,6 +739,10 @@ PCCTMC3Decoder3::decodeAttributeBrick(const PayloadBuffer& buf)
   int abhSize;
   abh = parseAbh(*_sps, attr_aps, buf, &abhSize);
 
+  attrInterPredParams.frameDistance = 1;
+  attrInterPredParams.enableAttrInterPred = attr_aps.attrInterPredictionEnabled && !abh.disableAttrInterPred;
+  abh.attrInterPredSearchRange = attr_aps.attrInterPredSearchRange; 
+
   pcc::chrono::Stopwatch<pcc::chrono::utime_inc_children_clock> clock_user;
 
   // replace the attribute decoder if not compatible
@@ -525,9 +758,26 @@ PCCTMC3Decoder3::decodeAttributeBrick(const PayloadBuffer& buf)
     // If predgeom was used, re-use the internal positions rather than
     // calculating afresh.
     Box3<int> bboxRpl;
+
+    pcc::point_t minPos = 0;
+
     if (_gps->predgeom_enabled_flag) {
       altPositions = _posSph;
       bboxRpl = Box3<int>(altPositions.begin(), altPositions.end());
+      minPos = bboxRpl.min;
+      if (attrInterPredParams.enableAttrInterPred) {
+        for (auto i = 0; i < 3; i++)
+          minPos[i] = minPos[i] < minPos_ref[i] ? minPos[i] : minPos_ref[i];
+        auto minPos_shift = minPos_ref - minPos;
+
+        if (minPos_shift[0] || minPos_shift[1] || minPos_shift[2])
+          offsetAndScaleShift(
+            minPos_shift, attr_aps.attr_coord_scale,
+            &attrInterPredParams.referencePointCloud[0],
+            &attrInterPredParams.referencePointCloud[0]
+              + attrInterPredParams.getPointCount());
+      }
+      minPos_ref = minPos;
     } else {
       altPositions.resize(_currentPointCloud.getPointCount());
 
@@ -537,23 +787,42 @@ PCCTMC3Decoder3::decodeAttributeBrick(const PayloadBuffer& buf)
         &_currentPointCloud[0],
         &_currentPointCloud[0] + _currentPointCloud.getPointCount(),
         altPositions.data());
+
+      if(!attr_aps.attrInterPredictionEnabled){
+        minPos = bboxRpl.min;
+      }
     }
 
     offsetAndScale(
-      bboxRpl.min, attr_aps.attr_coord_scale, altPositions.data(),
+      minPos, attr_aps.attr_coord_scale, altPositions.data(),
       altPositions.data() + altPositions.size());
 
     _currentPointCloud.swapPoints(altPositions);
   }
 
+  if (!attr_aps.spherical_coord_flag)
+    for (auto i = 0; i < _currentPointCloud.getPointCount(); i++)
+      _currentPointCloud[i] += _sliceOrigin;
+
   auto& ctxtMemAttr = _ctxtMemAttrs.at(abh.attr_sps_attr_idx);
   _attrDecoder->decode(
     *_sps, attr_sps, attr_aps, abh, _gbh.footer.geom_num_points_minus1,
     _params.minGeomNodeSizeLog2, buf.data() + abhSize, buf.size() - abhSize,
-    ctxtMemAttr, _currentPointCloud);
+    ctxtMemAttr, _currentPointCloud
+    , attrInterPredParams);
+
+  if (!attr_aps.spherical_coord_flag)
+    for (auto i = 0; i < _currentPointCloud.getPointCount(); i++)
+      _currentPointCloud[i] -= _sliceOrigin;
 
   if (attr_aps.spherical_coord_flag)
     _currentPointCloud.swapPoints(altPositions);
+
+  attrInterPredParams.referencePointCloud.clear();
+  if (attr_aps.spherical_coord_flag) {
+    attrInterPredParams.referencePointCloud = _currentPointCloud;
+    attrInterPredParams.referencePointCloud.swapPoints(altPositions);
+  }
 
   // Note the current sliceID for loss detection
   _ctxtMemAttrSliceIds[abh.attr_sps_attr_idx] = _sliceId;

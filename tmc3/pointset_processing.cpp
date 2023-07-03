@@ -39,9 +39,11 @@
 #include "hls.h"
 #include "KDTreeVectorOfVectorsAdaptor.h"
 
+#include <array>
 #include <cstddef>
 #include <set>
 #include <vector>
+#include <bitset>
 #include <utility>
 #include <map>
 
@@ -148,7 +150,30 @@ quantizePositionsUniq(
 {
   auto qFn = [=](Vec3<int> point) {
     for (int k = 0; k < 3; k++) {
-      double posk = std::round(point[k] * scaleFactor) - offset[k];
+      double posk =
+        std::round(point[k] * double(Rational(scaleFactor))) - offset[k];
+      point[k] = PCCClip(int32_t(posk), clamp.min[k], clamp.max[k]);
+    }
+    return point;
+  };
+
+  return reducePointSet(src, qFn, qFn);
+}
+
+//============================================================================
+// Quantise the geometry of a point cloud, retaining unique points only.
+// Points in the @src point cloud are quantised by a multiplicitive
+// @scaleFactor with rounding, then clamped to @clamp.
+//
+//  NB: attributes are not processed.
+
+SrcMappedPointSet
+quantizePositionsUniqWithoutOffset(
+  const float scaleFactor, const Box3<int> clamp, const PCCPointSet3& src)
+{
+  auto qFn = [=](Vec3<int> point) {
+    for (int k = 0; k < 3; k++) {
+      double posk = std::round(point[k] * double(Rational(scaleFactor)));
       point[k] = PCCClip(int32_t(posk), clamp.min[k], clamp.max[k]);
     }
     return point;
@@ -187,7 +212,8 @@ quantizePositions(
     const auto point = src[i];
     auto& dstPoint = (*dst)[i];
     for (int k = 0; k < 3; ++k) {
-      double k_pos = std::round(point[k] * scaleFactor) - offset[k];
+      double k_pos =
+        std::round(point[k] * double(Rational(scaleFactor))) - offset[k];
       dstPoint[k] = PCCClip(int32_t(k_pos), clamp.min[k], clamp.max[k]);
     }
   }
@@ -592,6 +618,125 @@ recolourColour(
   return true;
 }
 
+bool
+recolourColourPost(
+  const PCCPointSet3& source,
+  double sourceToTargetScaleFactor,
+  point_t targetToSourceOffset,
+  PCCPointSet3& target)
+{
+  const size_t orgPointCount = source.getPointCount();
+  const size_t recPointCount = target.getPointCount();
+  if (!orgPointCount || !recPointCount || !source.hasColors()) {
+    return false;
+  }
+
+  target.addColors();
+  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeRec(3, target, 10);
+  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeOrg(3, source, 10);
+
+  std::vector<std::vector<Vec3<attr_t>>> referColors1;
+  referColors1.resize(recPointCount);
+
+  // For each point of the origin point cloud,
+  // find its nearest neighbor in the reconstructed cloud
+  std::vector<size_t> indices;
+  std::vector<double> sqrDist;
+  //This will used a original point to chongjian points
+  for (int i = 0; i < orgPointCount; i++) {
+    const Vec3<attr_t> curColor = source.getColor(i);
+    Vec3<double> QuanPos =
+      (source[i] - targetToSourceOffset) * sourceToTargetScaleFactor;
+    int resultMax1 = 30;
+    int resultNum1 = 0;
+    do {
+      resultNum1 += 5;
+      indices.resize(resultNum1);
+      sqrDist.resize(resultNum1);
+      nanoflann::KNNResultSet<double> resultSet1(resultNum1);
+      resultSet1.init(&indices[0], &sqrDist[0]);
+      kdtreeRec.index->findNeighbors(
+        resultSet1, &QuanPos[0], nanoflann::SearchParams(10));
+    } while (sqrDist[0] == sqrDist[resultNum1 - 1]
+             && resultNum1 + 5 <= resultMax1);
+    //! same distance points
+    referColors1[indices[0]].push_back(curColor);
+    for (int j = 1; j < resultNum1; j++) {
+      if (abs(sqrDist[j] - sqrDist[0]) < 1e-8) {
+        referColors1[indices[j]].push_back(curColor);
+      } else
+        break;
+    }
+  }
+  // -First project the points of the origin cloud to the reconstructed cloud.
+  //  In case multiple origin points map to a single reconstructed point, the
+  //  mean value is used.
+  // -For the remained uncolored points, use their nearest neighbor attribute
+  //  found above as their new attribute value
+  for (int i = 0; i < recPointCount; i++) {
+    if (referColors1[i].empty()) {
+      // if using Orignal KD-Tree not found nearset,will used Reconstruct KD-Tree
+      double InverseQuanStep = 1.0 / sourceToTargetScaleFactor;
+      Vec3<double> InverQuanPos =
+        target[i] * InverseQuanStep + targetToSourceOffset;
+
+      int resultMax = 30;
+      int resultNum2 = 0;
+      do {
+        resultNum2 += 5;
+        indices.resize(resultNum2);
+        sqrDist.resize(resultNum2);
+        nanoflann::KNNResultSet<double> resultSet2(resultNum2);
+        resultSet2.init(&indices[0], &sqrDist[0]);
+        kdtreeOrg.index->findNeighbors(
+          resultSet2, &InverQuanPos[0], nanoflann::SearchParams(10));
+      } while (sqrDist[0] == sqrDist[resultNum2 - 1]
+               && resultNum2 + 5 <= resultMax);
+
+      size_t idx = indices[0];
+      assert(idx >= 0);
+
+      //! same distance points
+      std::vector<size_t> multineighbour;
+      multineighbour.push_back(idx);
+      for (int j = 1; j < resultNum2; j++) {
+        if (abs(sqrDist[j] - sqrDist[0]) < 1e-8) {
+          multineighbour.push_back(indices[j]);
+        } else
+          break;
+      }
+
+      point_t colorAvg(0.0);
+      for (const auto idx : multineighbour) {
+        const auto color = source.getColor(idx);
+        for (size_t k = 0; k < 3; k++) {
+          colorAvg[k] += color[k];
+        }
+      }
+      colorAvg /= (double)multineighbour.size();
+      Vec3<attr_t> refColor;
+      for (size_t k = 0; k < 3; k++) {
+        refColor[k] = PCCClip(std::round(colorAvg[k]), 0.0, 255.0);
+      }
+      target.setColor(i, refColor);
+    } else {
+      point_t avgAttr(0.0);
+      for (const auto color : referColors1[i]) {
+        for (size_t k = 0; k < 3; k++) {
+          avgAttr[k] += color[k];
+        }
+      }
+      avgAttr /= double(referColors1[i].size());
+      Vec3<attr_t> avgColor;
+      for (size_t k = 0; k < 3; k++) {
+        avgColor[k] = PCCClip(std::round(avgAttr[k]), 0.0, 255.0);
+      }
+      target.setColor(i, avgColor);
+    }
+  }
+  return true;
+}
+
 //============================================================================
 // Determine reflectance attribute values from a reference/source point cloud.
 // For each point of the target p_t:
@@ -914,6 +1059,136 @@ recolourReflectance(
   return true;
 }
 
+bool
+recolourReflectancePost(
+  const AttributeDescription& attrDesc,
+  const RecolourParams& cfg,
+  const PCCPointSet3& source,
+  double sourceToTargetScaleFactor,
+  point_t targetToSourceOffset,
+  PCCPointSet3& target)
+{
+  double targetToSourceScaleFactor = 1.0 / sourceToTargetScaleFactor;
+
+  const size_t pointCountSource = source.getPointCount();
+  const size_t pointCountTarget = target.getPointCount();
+  if (!pointCountSource || !pointCountTarget || !source.hasReflectances()) {
+    return false;
+  }
+  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeTarget(
+    3, target, 10);
+  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeSource(
+    3, source, 10);
+  target.addReflectances();
+  std::vector<attr_t> refinedReflectances1;
+  refinedReflectances1.resize(pointCountTarget);
+
+  double clipMax = (1 << attrDesc.bitdepth) - 1;
+
+  double maxGeometryDist2Fwd = (cfg.maxGeometryDist2Fwd < 512)
+    ? cfg.maxGeometryDist2Fwd
+    : std::numeric_limits<double>::max();
+  double maxGeometryDist2Bwd = (cfg.maxGeometryDist2Bwd < 512)
+    ? cfg.maxGeometryDist2Bwd
+    : std::numeric_limits<double>::max();
+  double maxAttributeDist2Fwd = (cfg.maxAttributeDist2Fwd < 512)
+    ? cfg.maxAttributeDist2Fwd
+    : std::numeric_limits<double>::max();
+  double maxAttributeDist2Bwd = (cfg.maxAttributeDist2Bwd < 512)
+    ? cfg.maxAttributeDist2Bwd
+    : std::numeric_limits<double>::max();
+
+  // Forward direction
+  const int num_resultsFwd = cfg.numNeighboursFwd;
+  nanoflann::KNNResultSet<double> resultSetFwd(num_resultsFwd);
+  std::vector<size_t> indicesFwd(num_resultsFwd);
+  std::vector<double> sqrDistFwd(num_resultsFwd);
+  for (size_t index = 0; index < pointCountTarget; ++index) {
+    resultSetFwd.init(&indicesFwd[0], &sqrDistFwd[0]);
+
+    Vec3<double> posInSrc =
+      (target[index] + targetToSourceOffset) * targetToSourceScaleFactor;
+
+    kdtreeSource.index->findNeighbors(
+      resultSetFwd, &posInSrc[0], nanoflann::SearchParams(10));
+
+    while (1) {
+      if (indicesFwd.size() == 1)
+        break;
+
+      if (sqrDistFwd[int(resultSetFwd.size()) - 1] <= maxGeometryDist2Fwd)
+        break;
+
+      sqrDistFwd.pop_back();
+      indicesFwd.pop_back();
+    }
+
+    bool isDone = false;
+    if (cfg.skipAvgIfIdenticalSourcePointPresentFwd) {
+      if (sqrDistFwd[0] < 0.0001) {
+        refinedReflectances1[index] = source.getReflectance(indicesFwd[0]);
+        isDone = true;
+      }
+    }
+
+    if (isDone)
+      continue;
+
+    int nNN = indicesFwd.size();
+    while (nNN > 0 && !isDone) {
+      if (nNN == 1) {
+        refinedReflectances1[index] = source.getReflectance(indicesFwd[0]);
+        isDone = true;
+        continue;
+      }
+
+      std::vector<attr_t> reflectances;
+      reflectances.resize(0);
+      reflectances.resize(nNN);
+      for (int i = 0; i < nNN; ++i) {
+        reflectances[i] = double(source.getReflectance(indicesFwd[i]));
+      }
+      double maxAttributeDist2 = std::numeric_limits<double>::min();
+      for (int i = 0; i < nNN; ++i) {
+        for (int j = 0; j < nNN; ++j) {
+          const double dist2 = pow(reflectances[i] - reflectances[j], 2);
+          if (dist2 > maxAttributeDist2)
+            maxAttributeDist2 = dist2;
+        }
+      }
+      if (maxAttributeDist2 > maxAttributeDist2Fwd) {
+        --nNN;
+      } else {
+        double refinedReflectance = 0.0;
+        if (cfg.useDistWeightedAvgFwd) {
+          double sumWeights{0.0};
+          for (int i = 0; i < nNN; ++i) {
+            const double weight = 1 / (sqrDistFwd[i] + cfg.distOffsetFwd);
+            refinedReflectance +=
+              source.getReflectance(indicesFwd[i]) * weight;
+            sumWeights += weight;
+          }
+          refinedReflectance /= sumWeights;
+        } else {
+          for (int i = 0; i < nNN; ++i)
+            refinedReflectance += source.getReflectance(indicesFwd[i]);
+          refinedReflectance /= nNN;
+        }
+        refinedReflectances1[index] =
+          attr_t(PCCClip(round(refinedReflectance), 0.0, clipMax));
+        isDone = true;
+      }
+    }
+  }
+
+  for (size_t index = 0; index < pointCountTarget; ++index) {
+    const attr_t reflectance1 = refinedReflectances1[index];
+    target.setReflectance(index, reflectance1);
+  }
+
+  return true;
+}
+
 //============================================================================
 // Colour attributes of a target point cloud given a source.
 //
@@ -945,6 +1220,41 @@ recolour(
   if (desc.attributeLabel == KnownAttributeLabel::kReflectance) {
     bool ok = recolourReflectance(
       desc, cfg, source, sourceToTargetScaleFactor, tgtToSrcOffset, *target);
+
+    if (!ok) {
+      std::cout << "Error: can't transfer reflectance!" << std::endl;
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+int
+recolourPost(
+  const AttributeDescription& desc,
+  const RecolourParams& cfg,
+  const PCCPointSet3& source,
+  float sourceToTargetScaleFactor,
+  point_t tgtToSrcOffset,
+  PCCPointSet3* target)
+{
+  // todo(df): fix the incorrect assumption here that 3-component
+  // attributes are colour (and that single components are reflectance)
+  if (desc.attributeLabel == KnownAttributeLabel::kColour) {
+    bool ok = recolourColourPost(
+      source, sourceToTargetScaleFactor, tgtToSrcOffset, *target);
+
+    if (!ok) {
+      std::cout << "Error: can't transfer colors!" << std::endl;
+      return -1;
+    }
+  }
+
+  if (desc.attributeLabel == KnownAttributeLabel::kReflectance) {
+    bool ok = recolourReflectance(
+      desc, cfg, source, sourceToTargetScaleFactor, tgtToSrcOffset,
+      *target);  // To be updated
 
     if (!ok) {
       std::cout << "Error: can't transfer reflectance!" << std::endl;
@@ -1054,6 +1364,91 @@ orderByAzimuth(
 }
 
 //============================================================================
+
+std::vector<int>
+orderByAzimuth(
+  PCCPointSet3& cloud,
+  int start,
+  int end,
+  double recipBinWidth,
+  Vec3<int32_t> origin,
+  const int32_t positionAzimuthScaleLog2,
+  const int32_t azimuthSpeed,
+  const std::vector<int32_t>& angularTheta,
+  const std::vector<int32_t>& angularZ)
+{
+  if (recipBinWidth != 0.) {
+    recipBinWidth *= azimuthSpeed;
+  }
+  // build a list of inxdexes to sort
+  auto pointCount = end - start;
+  std::vector<int> order(pointCount);
+  for (int i = 0; i < pointCount; i++)
+    order[i] = i;
+
+  int numLasers = angularZ.size();
+
+  const int kpi = 1<<positionAzimuthScaleLog2-1;
+  std::vector<point_t> lidarCoord(pointCount);
+  for (int i = 0; i < pointCount; i++) {
+    auto a = cloud[start + i] - origin;
+
+    int32_t rA = int32_t(hypot(a[0], a[1])*(1<<8) + 0.5);
+    double dphiA = (atan2(double(a[1]), double(a[0]))+M_PI);
+    if (recipBinWidth != 0.) {
+      dphiA = dphiA * recipBinWidth;
+    }
+    else {
+      dphiA = dphiA * kpi / M_PI / azimuthSpeed;
+    }
+    int32_t phiIndexA = dphiA + 0.5;
+    int32_t laserIndexA = findLaserPrecise(a, angularTheta.data(), angularZ.data(), numLasers);
+    lidarCoord[i] = {rA, phiIndexA, laserIndexA};
+  }
+
+
+  std::sort(order.begin(), order.end(), [&](int aIdx, int bIdx) {
+    auto a = lidarCoord[aIdx];
+    auto b = lidarCoord[bIdx];
+
+    return a[1] != b[1] ? a[1] < b[1]
+                        : a[2] != b[2] ? a[2] < b[2] : a[0] < b[0];
+  });
+
+  // now sort to minimize r-jump
+  std::vector<int32_t> lastR (numLasers);
+  for (int l = 0; l < numLasers; l++)
+    lastR[l] = 0;
+
+  int startRange = 0;
+  int32_t startPhiIndex = lidarCoord[order[0]][1];
+  int32_t startLaserIndex = lidarCoord[order[0]][2];
+  for (int i = 0; i < pointCount; i++) {
+    int32_t currentPhiIndex = lidarCoord[order[i]][1];
+    int32_t currentLaserIndex = lidarCoord[order[i]][2];
+    if (currentPhiIndex != startPhiIndex
+      || currentLaserIndex != startLaserIndex
+      || i == pointCount - 1 ) {
+      // range completed
+      int32_t minR = lidarCoord[order[startRange]][0];
+      int32_t maxR = lidarCoord[order[i-1]][0];
+
+      // minimize r-jump
+      if (std::abs(minR - lastR[startLaserIndex]) > std::abs(maxR - lastR[startLaserIndex]))
+        std::reverse(&order[startRange], &order[i]);
+
+      // update for next range
+      lastR[startLaserIndex] = lidarCoord[order[i-1]][0];
+      startPhiIndex = currentPhiIndex;
+      startLaserIndex = currentLaserIndex;
+      startRange = i;
+    }    // end if range completed
+  }
+
+  return order;
+}
+
+//============================================================================
 // Sorts according to azimuth.
 // \param recipBinWidth is the reciprocal bin width used in sorting.
 //        recipBinWidth = 0 disables binning.
@@ -1074,6 +1469,33 @@ sortByAzimuth(
     while (order[i] - start != i) {
       cloud.swapPoints(order[i], order[order[i] - start]);
       std::swap(order[i], order[order[i] - start]);
+    }
+  }
+}
+
+//============================================================================
+// Sort for LiDAR
+
+void
+sortByAzimuth(
+  PCCPointSet3& cloud,
+  int start,
+  int end,
+  double recipBinWidth,
+  Vec3<int32_t> origin,
+  const int32_t positionAzimuthScaleLog2,
+  const int32_t azimuthSpeed,
+  const std::vector<int32_t>& angularTheta,
+  const std::vector<int32_t>& angularZ)
+{
+  auto pointCount = end - start;
+  auto order = orderByAzimuth(cloud, start, end, recipBinWidth, origin, positionAzimuthScaleLog2, azimuthSpeed, angularTheta, angularZ);
+
+  // inefficiently reorder the point cloud
+  for (int i = 0; i < pointCount; i++) {
+    while (order[i] != i) {
+      cloud.swapPoints(start + order[i], start + order[order[i]]);
+      std::swap(order[i], order[order[i]]);
     }
   }
 }
@@ -1156,14 +1578,16 @@ orderByLaserAngle(
       phiB = std::round(phiB * recipBinWidth);
     }
 
-    // NB: the a < b comparison adds some stability to the sort.  It is not
+    // NB: the aIdx < bIdx comparison adds some stability to the sort.  It is not
     // required in an actual implementation.  Either slightly more performance
     // can be achieved by sorting by a second data dependent dimension, or
     // efficiency can be improved by removing the stability (at a cost of
     // being able to reproduce the exact same bitstream).
 
     return phiB != phiA ? phiA < phiB
-                        : rA != rB ? rA < rB : tanThetaA < tanThetaB;
+            : rA != rB ? rA < rB
+            : tanThetaA != tanThetaB ? tanThetaA < tanThetaB
+            : aIdx < bIdx;
   });
 
   return order;
@@ -1196,6 +1620,333 @@ sortByLaserAngle(
       std::swap(order[i], order[order[i] - start]);
     }
   }
+}
+
+//
+robin_hood::unordered_map<int64_t, int>
+occupancy(const PCCPointSet3& Vp)
+{
+  robin_hood::unordered_map<int64_t, int> occu;
+  for (int i = 0; i < Vp.getPointCount(); i++) {
+    occu.insert({mortonAddr64(Vp[i]), 1});
+  }
+  return occu;
+}
+
+std::vector<int>
+get_children2(const PCCPointSet3& Vp, const PCCPointSet3& V)
+{  //s=2
+  std::vector<std::vector<int>> kids(Vp.getPointCount());
+  for (int i = 0; i < kids.size(); i++) {
+    kids[i].resize(8);
+  }
+  robin_hood::unordered_map<int64_t, int> occu = occupancy(V);
+  for (int i = 0; i < Vp.getPointCount(); i++) {
+    point_t uppoint, delta;
+    delta[0] = delta[1] = delta[2] = 0;
+    for (int k = 0; k < 3; k++) {
+      uppoint[k] = round(Vp[i][k] * 2);
+    }
+    kids[i][0] = occu.find(mortonAddr64(uppoint)) != occu.end();
+    delta[0] = -1;
+    kids[i][1] = occu.find(mortonAddr64(uppoint + delta)) != occu.end();
+    delta[0] = 0;
+    delta[1] = -1;
+    kids[i][2] = occu.find(mortonAddr64(uppoint + delta)) != occu.end();
+    delta[0] = -1;
+    kids[i][3] = occu.find(mortonAddr64(uppoint + delta)) != occu.end();
+    delta[0] = 0;
+    delta[1] = 0;
+    delta[2] = -1;
+    kids[i][4] = occu.find(mortonAddr64(uppoint + delta)) != occu.end();
+    delta[0] = -1;
+    kids[i][5] = occu.find(mortonAddr64(uppoint + delta)) != occu.end();
+    delta[0] = 0;
+    delta[1] = -1;
+    kids[i][6] = occu.find(mortonAddr64(uppoint + delta)) != occu.end();
+    delta[0] = -1;
+    kids[i][7] = occu.find(mortonAddr64(uppoint + delta)) != occu.end();
+  }
+  std::vector<int> new_kids(Vp.getPointCount());
+  int bases[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+  for (int i = 0; i < kids.size(); i++) {
+    new_kids[i] = 0;
+    for (int k = 0; k < 8; k++) {
+      if (kids[i][k])
+        new_kids[i] += bases[k];
+    }
+  }
+  return new_kids;
+}
+
+std::vector<int>
+get_neighbours(const PCCPointSet3& Vp, const int n_neighbors)
+{
+  std::vector<int> neighs(Vp.getPointCount());
+  if (n_neighbors == 0) {
+    for (int i = 0; i < Vp.getPointCount(); i++) {
+      neighs[i] = 0;
+    }
+    return neighs;
+  }
+  double init_deltas[26][3] = {
+    {-1, 0, 0},   {0, -1, 0},  {0, 0, -1},  {1, 0, 0},
+    {0, 1, 0},    {0, 0, 1},  // shared faces
+    {0, -1, -1},  {0, -1, 1},  {0, 1, -1},  {0, 1, 1},
+    {-1, 0, -1},  {-1, 0, 1},  {1, 0, -1},  {1, 0, 1},
+    {-1, -1, 0},  {-1, 1, 0},  {1, -1, 0},  {1, 1, 0},  // shared lines
+    {-1, -1, -1}, {-1, -1, 1}, {-1, 1, -1}, {-1, 1, 1},
+    {1, -1, -1},  {1, -1, 1},  {1, 1, -1},  {1, 1, 1}  // shared points
+  };
+  std::vector<point_t> deltas(n_neighbors);
+  for (int k = 0; k < n_neighbors; k++) {
+    deltas[k][0] = init_deltas[k][0];
+    deltas[k][1] = init_deltas[k][1];
+    deltas[k][2] = init_deltas[k][2];
+  }
+  int bases[26];
+  for (int i = 0; i < 26; i++) {
+    bases[i] = (1 << i);
+  }
+  robin_hood::unordered_map<int64_t, int> occu = occupancy(Vp);
+  //auto start = std::chrono::system_clock::now();
+  for (int i = 0; i < Vp.getPointCount(); i++) {
+    neighs[i] = 0;
+    for (int k = 0; k < n_neighbors; k++) {
+      // a big time cost: occu.find(mortonAddr64(Vp[i] - deltas[k])) != occu.end()
+      if (occu.find(mortonAddr64(Vp[i] - deltas[k])) != occu.end()) {
+        neighs[i] += bases[k];
+      }
+    }
+  }
+  //auto end = std::chrono::system_clock::now();
+  //auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  //std::cout << "How much time is wasted here? -> "
+  //          << double(duration.count()) * std::chrono::microseconds::period::num /
+  //    std::chrono::microseconds::period::den
+  //          << "s" << std::endl;
+  return neighs;
+}
+//----------------------------------------------------------------------------
+// build LUT
+
+std::vector<int>
+buildLUT2(
+  const PCCPointSet3& Vp,
+  const PCCPointSet3& V,
+  const std::vector<int>& uncles)
+{  // s=2
+  std::vector<int> kids = get_children2(Vp, V);
+  std::vector<int> lut(Vp.getPointCount());  //
+  int idxs = 0;
+  robin_hood::unordered_map<int, std::vector<int>> uncles2kids;
+  robin_hood::unordered_map<int, int> u2k_idx;
+  for (int kk = 0; kk < uncles.size(); kk++) {
+    if (u2k_idx.find(uncles[kk]) != u2k_idx.end()) {
+      u2k_idx[uncles[kk]] = u2k_idx[uncles[kk]] + 1;
+    } else {
+      u2k_idx[uncles[kk]] = 1;
+    }
+  }
+  for (auto iter = u2k_idx.begin(); iter != u2k_idx.end(); iter++) {
+    uncles2kids[iter->first].resize(iter->second);
+    u2k_idx[iter->first] = 0;
+  }
+  for (int kk = 0; kk < uncles.size(); kk++) {
+    uncles2kids[uncles[kk]][u2k_idx[uncles[kk]]] = kids[kk];
+    u2k_idx[uncles[kk]] = u2k_idx[uncles[kk]] + 1;
+  }
+  for (auto iter = uncles2kids.begin(); iter != uncles2kids.end(); iter++) {
+    std::vector<int> curr_lut = iter->second;
+    int cal[8] = {};
+    int children = 0;
+    for (int j = 0; j < curr_lut.size(); j++) {
+      std::bitset<8> bs(curr_lut[j]);
+      cal[0] += bs[0];
+      cal[1] += bs[1];
+      cal[2] += bs[2];
+      cal[3] += bs[3];
+      cal[4] += bs[4];
+      cal[5] += bs[5];
+      cal[6] += bs[6];
+      cal[7] += bs[7];
+    }
+    if (cal[0] * 2 >= curr_lut.size())
+      children += 1;
+    if (cal[1] * 2 >= curr_lut.size())
+      children += 2;
+    if (cal[2] * 2 >= curr_lut.size())
+      children += 4;
+    if (cal[3] * 2 >= curr_lut.size())
+      children += 8;
+    if (cal[4] * 2 >= curr_lut.size())
+      children += 16;
+    if (cal[5] * 2 >= curr_lut.size())
+      children += 32;
+    if (cal[6] * 2 >= curr_lut.size())
+      children += 64;
+    if (cal[7] * 2 >= curr_lut.size())
+      children += 128;
+    if (children == 0) {
+      children = 1;
+    }
+    lut[idxs] = children;
+    idxs = idxs + 1;
+  }
+  lut.resize(idxs);
+  return lut;
+}
+
+//----------------------------------------------------------------------------
+// reconLUT
+//pair<vector<int>, vector<int>>
+std::tuple<std::vector<int>, std::vector<int>>
+get_num_childs(const PCCPointSet3& Vd, const float s)
+{  // 1<s<2
+  auto pq = Rational(s);
+  int p = pq.numerator, q = pq.denominator;
+  std::vector<int> x(p), xd(p), hist(q);
+  for (int i = 0; i < p; i++) {
+    x[i] = i;
+    xd[i] = round(x[i] / double(pq));
+    hist[xd[i]] += 1;
+  }
+  std::vector<int> dup;
+  for (int i = 0; i < hist.size(); i++) {
+    if (hist[i] == 2) {
+      dup.push_back(i);
+    }
+  }
+  std::vector<int> x_ch(2 * dup.size());
+  int idx = 0;
+  for (int i = 0; i < p; i++) {
+    if (hist[xd[i]] == 2) {
+      x_ch[idx] = x[i] - round(xd[i] * double(pq));
+      idx = idx + 1;
+    }
+  }
+  std::vector<int> num_child(3 * Vd.getPointCount());
+  std::vector<int> num_childs(Vd.getPointCount());
+  int r;
+  for (int i = 0; i < Vd.getPointCount(); i++) {
+    for (int k = 0; k < 3; k++) {
+      r = int(Vd[i][k]) % q;
+      for (int j = 0; j < dup.size(); j++) {
+        if (r == dup[j])
+          num_child[3 * i + k] = x_ch[2 * j] + x_ch[2 * j + 1];
+        else
+          num_child[3 * i + k] = 0;
+      }
+    }
+    num_childs[i] = abs(num_child[3 * i]) + 2 * abs(num_child[3 * i + 1])
+      + 4 * abs(num_child[3 * i + 2]);
+  }
+  return {num_child, num_childs};
+}
+
+robin_hood::unordered_map<int, int>
+reconLUT2(
+  const PCCPointSet3& Vd,
+  const std::vector<int>& lut_values,
+  const std::vector<int>& neighs)
+{
+  const float s = 2;
+  robin_hood::unordered_map<int, int> lut;
+  for (int i = 0; i < Vd.getPointCount(); i++) {  // 8 child, xyz
+    lut.insert({neighs[i], 0});
+  }
+  int idx = 0;
+  for (auto iter = lut.begin(); iter != lut.end(); iter++) {
+    iter->second = lut_values[idx];
+    idx += 1;
+  }
+  return lut;
+}
+//---------------------------------------------------------------------------
+// PUM
+
+PCCPointSet3
+PUM2(
+  const PCCPointSet3& m_pointCloudQuant,
+  robin_hood::unordered_map<int, int>& lut,
+  const std::vector<int>& neighs,
+  const bool fastRecolor)
+{  // s=2
+  PCCPointSet3 m_pointCloudQuantE;
+  m_pointCloudQuantE.resize(8 * m_pointCloudQuant.getPointCount());
+  if (m_pointCloudQuant.hasColors()) {
+    m_pointCloudQuantE.addColors();
+  }
+  if (m_pointCloudQuant.hasReflectances()) {
+    m_pointCloudQuantE.addReflectances();
+  }
+  int idx = 0;
+  int idx0;
+  for (int i = 0; i < m_pointCloudQuant.getPointCount(); i++) {
+    idx0 = idx;
+    point_t uppoint = m_pointCloudQuant[i] * 2;
+    point_t delta;
+    delta[0] = delta[1] = delta[2] = 0;
+    std::bitset<8> bs8(lut[neighs[i]]);
+    if (bs8[0] || lut[neighs[i]] == 0) {
+      m_pointCloudQuantE[idx] = uppoint;
+      idx = idx + 1;
+    }
+    delta[0] = -1;
+    if (bs8[1]) {
+      m_pointCloudQuantE[idx] = uppoint + delta;
+      idx = idx + 1;
+    }
+    delta[0] = 0;
+    delta[1] = -1;
+    if (bs8[2]) {
+      m_pointCloudQuantE[idx] = uppoint + delta;
+      idx = idx + 1;
+    }
+    delta[0] = -1;
+    if (bs8[3]) {
+      m_pointCloudQuantE[idx] = uppoint + delta;
+      idx = idx + 1;
+    }
+    delta[0] = 0;
+    delta[1] = 0;
+    delta[2] = -1;
+    if (bs8[4]) {
+      m_pointCloudQuantE[idx] = uppoint + delta;
+      idx = idx + 1;
+    }
+    delta[0] = -1;
+    if (bs8[5]) {
+      m_pointCloudQuantE[idx] = uppoint + delta;
+      idx = idx + 1;
+    }
+    delta[0] = 0;
+    delta[1] = -1;
+    if (bs8[6]) {
+      m_pointCloudQuantE[idx] = uppoint + delta;
+      idx = idx + 1;
+    }
+    delta[0] = -1;
+    if (bs8[7]) {
+      m_pointCloudQuantE[idx] = uppoint + delta;
+      idx = idx + 1;
+    }
+    if (fastRecolor) {
+      if (m_pointCloudQuant.hasColors()) {
+        for (int ii = idx0; ii < idx; ii++) {
+          m_pointCloudQuantE.setColor(ii, m_pointCloudQuant.getColor(i));
+        }
+      }
+      if (m_pointCloudQuant.hasReflectances()) {
+        for (int ii = idx0; ii < idx; ii++) {
+          m_pointCloudQuantE.setReflectance(
+            ii, m_pointCloudQuant.getReflectance(i));
+        }
+      }
+    }
+  }
+  m_pointCloudQuantE.resize(idx);
+  return m_pointCloudQuantE;
 }
 
 }  // namespace pcc

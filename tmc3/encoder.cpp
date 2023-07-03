@@ -39,6 +39,7 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <numeric>
 
 #include "Attribute.h"
 #include "AttributeCommon.h"
@@ -54,7 +55,9 @@
 #include "partitioning.h"
 #include "pcc_chrono.h"
 #include "ply.h"
-
+#include "BitWriter.h"
+#include "ari.h"
+#include "TMC3.h"
 namespace pcc {
 
 //============================================================================
@@ -86,7 +89,8 @@ PCCTMC3Encoder3::compress(
   const PCCPointSet3& inputPointCloud,
   EncoderParams* params,
   PCCTMC3Encoder3::Callbacks* callback,
-  CloudFrame* reconCloud)
+  CloudFrame* reconCloud,
+  bool postProcessReconCloud)
 {
   // start of frame
   _frameCounter++;
@@ -97,7 +101,8 @@ PCCTMC3Encoder3::compress(
     //  - sequence scaling is replaced by decimation of the input
     //  - any user-specified global scaling is honoured
     _inputDecimationScale = 1.;
-    if (params->gps.predgeom_enabled_flag) {
+    if (params->gps.predgeom_enabled_flag
+        && params->gps.geom_angular_mode_enabled_flag) {
       _inputDecimationScale = params->codedGeomScale;
       params->codedGeomScale /= params->seqGeomScale;
       params->seqGeomScale = 1.;
@@ -107,6 +112,17 @@ PCCTMC3Encoder3::compress(
     fixupParameterSets(params);
 
     _srcToCodingScale = params->codedGeomScale;
+
+    _numGeomCoffAdjust =
+      std::ceil(std::log(1 / _srcToCodingScale) / std::log(2));
+    if (params->gps.geom_unique_points_flag) {
+      if (params->seq_max_num_pcs_in_pyramid_minus1) {
+        _srcToCodingScale =
+          (1 << params->rate_point) / 128.0 / (1 << _numGeomCoffAdjust);  //
+        params->sps.seqGeomScale = Rational(_srcToCodingScale);
+        //std::cout << "seqGeomScale=" << _srcToCodingScale << std::endl;
+      }
+    }
 
     // Determine input bounding box (for SPS metadata) if not manually set
     Box3<int> bbox;
@@ -123,6 +139,12 @@ PCCTMC3Encoder3::compress(
     if (!bboxSizeDefined)
       params->sps.seqBoundingBoxSize = (1 << 21) - 1;
 
+    int L;
+    if (params->seq_max_num_pcs_in_pyramid_minus1) {
+      L = std::ceil(std::log(1 / _srcToCodingScale) / std::log(2)) - 1;
+      params->sps.seq_max_num_pcs_in_pyramid_minus1 =
+        std::max(1, L - _numGeomCoffAdjust + 1);
+    }
     // Then scale the bounding box to match the reconstructed output
     for (int k = 0; k < 3; k++) {
       auto min_k = bbox.min[k];
@@ -131,8 +153,19 @@ PCCTMC3Encoder3::compress(
       // the sps bounding box is in terms of the conformance scale
       // not the source scale.
       // NB: plus one to convert to range
-      min_k = std::round(min_k * params->seqGeomScale);
-      max_k = std::round(max_k * params->seqGeomScale);
+      if (params->sps.seq_max_num_pcs_in_pyramid_minus1) {
+        min_k = std::round(min_k / (1 << (_numGeomCoffAdjust)));
+        max_k = std::round(max_k / (1 << (_numGeomCoffAdjust)));
+        for (int kk = _numGeomCoffAdjust + 1; kk <= L; kk++) {
+          min_k = std::round(min_k / 2);
+          max_k = std::round(max_k / 2);
+        }
+        min_k = std::round(min_k * _srcToCodingScale * (1 << L));
+        max_k = std::round(max_k * _srcToCodingScale * (1 << L));
+      } else {
+        min_k = std::round(min_k * params->seqGeomScale);
+        max_k = std::round(max_k * params->seqGeomScale);
+      }
       params->sps.seqBoundingBoxOrigin[k] = min_k;
       params->sps.seqBoundingBoxSize[k] = max_k - min_k + 1;
 
@@ -194,6 +227,67 @@ PCCTMC3Encoder3::compress(
 
     // Allocate storage for attribute contexts
     _ctxtMemAttrs.resize(params->sps.attributeSets.size());
+    
+    if (params->gps.globalMotionEnabled) {
+      if (params->gps.predgeom_enabled_flag) {
+        _refFrameSph.parseMotionParams(motionVectorFileName, 1.0);
+      } else if (!params->gps.trisoup_enabled_flag) {
+        params->interGeom.motionParams.parseFile(
+          motionVectorFileName, params->codedGeomScale);
+        deriveMotionParams(params);
+      }
+    }
+  }
+  if (params->gps.globalMotionEnabled && params->interGeom.deriveGMThreshold) {
+    const auto pointCount = inputPointCloud.getPointCount();
+    const auto bbox = inputPointCloud.computeBoundingBox();
+    const int histScale = params->interGeom.gmThresholdHistScale;
+
+    const int minZ = std::max(bbox.min.z(), params->interGeom.gmThresholdMinZ);
+    const int maxZ = std::min(bbox.max.z(), params->interGeom.gmThresholdMaxZ);
+
+    const int histRange = (maxZ - minZ) / histScale;
+    std::vector<int> histInp(histRange), midVals(histRange);
+    std::vector<float> probs(histRange);
+
+    for (auto i = 0; i < pointCount; i++) {
+      auto scaledZ = (inputPointCloud[i].z() - minZ) / histScale;
+      if (scaledZ >= 0 && scaledZ < histRange)
+        histInp[scaledZ]++;
+    }
+
+    for (size_t i = 0; i < histRange; ++i)
+      midVals[i] = minZ + int((i + 0.5) * histScale);
+
+    const float sum = std::accumulate(histInp.begin(), histInp.end(), 0.);
+
+    for (size_t i = 0; i < histRange; ++i)
+      probs[i] = histInp[i] / sum;
+
+    const float mean =
+      std::inner_product(probs.begin(), probs.end(), midVals.begin(), 0.);
+
+    float variance = 0.0;
+    for (size_t i = 0; i < histRange; ++i)
+      variance += probs[i] * pow((midVals[i] - mean), 2);
+
+    const int topIdx =
+      std::max_element(histInp.begin(), histInp.end()) - histInp.begin();
+    const int top = midVals[topIdx];
+
+    const int deltaLeft =
+      params->interGeom.gmThresholdLeftScale * std::sqrt(variance);
+    const int deltaRight =
+      params->interGeom.gmThresholdRightScale * std::sqrt(variance);
+    const int leftOffset =
+      std::max(minZ, top - deltaLeft) * params->codedGeomScale;
+    const int rightOffset =
+      std::min(maxZ, top + deltaRight) * params->codedGeomScale;
+    if (params->gps.predgeom_enabled_flag)
+      _refFrameSph.updateThresholds(_frameCounter, leftOffset, rightOffset);
+    else if (!params->gps.trisoup_enabled_flag)
+      params->interGeom.motionParams.updateThresholds(
+        _frameCounter, leftOffset, rightOffset);
   }
 
   // placeholder to "activate" the parameter sets
@@ -226,7 +320,10 @@ PCCTMC3Encoder3::compress(
   //    slice partitioning subsequent
   //  todo(df):
   PartitionSet partitions;
-  SrcMappedPointSet quantizedInput = quantization(inputPointCloud);
+  std::vector<SrcMappedPointSet> quantizedInputs = quantization(
+    inputPointCloud, params->sps.seq_max_num_pcs_in_pyramid_minus1);
+  int K = quantizedInputs.size() - 1;
+  SrcMappedPointSet quantizedInput = quantizedInputs[K];
 
   // write out all parameter sets prior to encoding
   callback->onOutputBuffer(write(*_sps));
@@ -235,6 +332,7 @@ PCCTMC3Encoder3::compress(
     callback->onOutputBuffer(write(*_sps, *aps));
   }
 
+  geomBits = 0;
   std::vector<std::vector<int32_t>> tileMaps;
   if (params->partition.tileSize) {
     tileMaps = tilePartition(params->partition, quantizedInput.cloud);
@@ -314,6 +412,15 @@ PCCTMC3Encoder3::compress(
   //      slices conform to any codec limits.
   //  todo(df): consider requiring partitioning function to sort the input
   //            points and provide ranges rather than a set of indicies.
+
+  // use the largest trisoup node size as a partitioning boundary for
+  // consistency between slices with different trisoup node sizes.
+  int partitionBoundaryLog2 = 0;
+  if (!params->trisoupNodeSizesLog2.empty())
+    partitionBoundaryLog2 = *std::max_element(
+      params->trisoupNodeSizesLog2.begin(),
+      params->trisoupNodeSizesLog2.end());
+
   do {
     for (int t = 0; t < tileMaps.size(); t++) {
       const auto& tile = tileMaps[t];
@@ -334,14 +441,6 @@ PCCTMC3Encoder3::compress(
       auto partitionMethod = params->partition.method;
       if (tileCloud.getPointCount() < params->partition.sliceMaxPoints)
         partitionMethod = PartitionMethod::kNone;
-
-      // use the largest trisoup node size as a partitioning boundary for
-      // consistency between slices with different trisoup node sizes.
-      int partitionBoundaryLog2 = 0;
-      if (!params->trisoupNodeSizesLog2.empty())
-        partitionBoundaryLog2 = *std::max_element(
-          params->trisoupNodeSizesLog2.begin(),
-          params->trisoupNodeSizesLog2.end());
 
       //Slice partition of current tile
       std::vector<Partition> curSlices;
@@ -381,6 +480,16 @@ PCCTMC3Encoder3::compress(
     }
     std::cout << "Slice number: " << partitions.slices.size() << std::endl;
   } while (0);
+ 
+  if (_frameCounter){
+    if (params->gps.predgeom_enabled_flag) {
+      _refFrameSph.updateFrame(*_gps);
+    } else if (!params->gps.trisoup_enabled_flag) {
+      params->interGeom.motionParams.AdvanceFrame();
+    }
+  } else {
+    _refFrameSph.setGlobalMotionEnabled(_gps->globalMotionEnabled);
+  }
 
   // Encode each partition:
   //  - create a pointset comprising just the partitioned points
@@ -396,13 +505,223 @@ PCCTMC3Encoder3::compress(
     _sliceId = partition.sliceId;
     _tileId = partition.tileId;
     _sliceOrigin = sliceCloud.computeBoundingBox().min;
+
+    if (params->partition.safeTrisoupPartionning) {
+      int partitionBoundary = 1 << partitionBoundaryLog2;
+
+      _sliceOrigin[0] -= (_sliceOrigin[0] % partitionBoundary);
+      _sliceOrigin[1] -= (_sliceOrigin[1] % partitionBoundary);
+      _sliceOrigin[2] -= (_sliceOrigin[2] % partitionBoundary);
+    }
+
     compressPartition(sliceCloud, sliceSrcCloud, params, callback, reconCloud);
   }
 
+  // Hierarchical prior construction and encoding
+  pcc::chrono::Stopwatch<pcc::chrono::utime_inc_children_clock> clock_user;
+  clock_user.start();
+  if (K == 0) {
+    lut1.resize(0);
+    lut2.resize(0);
+  } else {
+    int L = std::ceil(std::log(1 / _srcToCodingScale) / std::log(2)) - 1;
+    double s = 1 / _srcToCodingScale / (1 << L);
+    //params->seq_num_neighbors_for_1st_prior = 6;  //
+    //params->seq_num_neighbors_for_1st_prior = 18; //
+    if (geomBits < 25000) {
+      params->seq_num_neighbors_for_1st_prior = 6;  //
+    } else if (geomBits > 200000) {
+      params->seq_num_neighbors_for_1st_prior = 18;  //
+    } else {
+      params->seq_num_neighbors_for_1st_prior = 12;  //
+    }
+    std::vector<int> neighs1 = get_neighbours(
+      reconCloud->cloud, params->seq_num_neighbors_for_1st_prior);
+    lut2.resize(K - 1);
+    PCCPointSet3 m_pointCloudQuantE;
+    std::vector<int> neighs2;
+    lut1 = buildLUT2(reconCloud->cloud, quantizedInputs[K - 1].cloud, neighs1);
+    if (K > 1) {
+      robin_hood::unordered_map<int, int> recon_lut1 =
+        reconLUT2(reconCloud->cloud, lut1, neighs1);
+      m_pointCloudQuantE = PUM2(reconCloud->cloud, recon_lut1, neighs1);
+      neighs2 = get_neighbours(m_pointCloudQuantE, 6);
+      lut2[K - 2] =
+        buildLUT2(m_pointCloudQuantE, quantizedInputs[K - 2].cloud, neighs2);
+    }
+    for (int k = 2; k < K; k++) {
+      robin_hood::unordered_map<int, int> recon_lut2 =
+        reconLUT2(m_pointCloudQuantE, lut2[K - k], neighs2);
+      m_pointCloudQuantE = PUM2(m_pointCloudQuantE, recon_lut2, neighs2);
+      neighs2 = get_neighbours(m_pointCloudQuantE, 6);
+      lut2[K - k - 1] = buildLUT2(
+        m_pointCloudQuantE, quantizedInputs[K - k - 1].cloud, neighs2);
+    }
+  }
+
+  PayloadBuffer payload(PayloadType::kLUTData);
+  auto bs = makeBitWriter(std::back_inserter(payload));
+  if (lut1.size()) {
+    int nL = params->seq_num_neighbors_for_1st_prior + 1;
+    my_model cmodel;
+    if (nL >= 6) {
+      std::ofstream hprior;
+      hprior.open(params->folderPath + "hprior.txt", std::ofstream::binary);
+      for (int i = 0; i < lut1.size(); i++) {
+        hprior << char(lut1[i] - 1);
+      }
+      hprior.close();
+      std::ofstream output1(
+        params->folderPath + "hprior.bin", std::ofstream::binary);
+      std::ifstream input1(
+        params->folderPath + "hprior.txt", std::ifstream::binary);
+      cmodel.reset(8);
+      compressAri(input1, output1, cmodel);
+      input1.close();
+      output1.close();
+      std::ifstream input0(
+        params->folderPath + "hprior.bin", std::ifstream::binary);
+      input0.seekg(0, std::ios::end);
+      bs.writeUn(nL, input0.tellg());  // wrong when nL is small, e.g., 1
+      input0.close();
+      std::ifstream input2(
+        params->folderPath + "hprior.bin", std::ifstream::binary);
+      for (;;) {
+        int value = input2.get();
+        if (value >= 0) {
+          bs.writeUn(8, value);
+        } else {
+          break;
+        }
+      }
+      input2.close();
+    } else {
+      bs.writeUn(nL, lut1.size());
+      for (int i = 0; i < lut1.size(); i++) {
+        bs.writeUn(8, lut1[i]);
+      }
+    }
+
+    if (lut2.size()) {
+      for (int k = 0; k < lut2.size(); k++) {
+        std::ofstream hprior;
+        hprior.open(params->folderPath + "hprior.txt", std::ofstream::binary);
+        for (int i = 0; i < lut2[k].size(); i++) {
+          hprior << char(lut2[k][i] - 1);
+        }
+        hprior.close();
+        std::ofstream output1(
+          params->folderPath + "hprior.bin", std::ofstream::binary);
+        std::ifstream input1(
+          params->folderPath + "hprior.txt", std::ifstream::binary);
+        cmodel.reset(8);
+        compressAri(input1, output1, cmodel);
+        input1.close();
+        output1.close();
+        std::ifstream input0(
+          params->folderPath + "hprior.bin", std::ifstream::binary);
+        input0.seekg(0, std::ios::end);
+        bs.writeUn(6, int(input0.tellg()) - 1);
+        input0.close();
+        std::ifstream input2(
+          params->folderPath + "hprior.bin", std::ifstream::binary);
+        for (;;) {
+          int value = input2.get();
+          if (value >= 0) {
+            bs.writeUn(8, value);
+          } else {
+            break;
+          }
+        }
+        input2.close();
+      }
+      //for (int k = 0; k < lut2.size(); k++) {
+      //  bs.writeUn(6, lut2[k].size() - 1);
+      //  for (int i = 0; i < lut2[k].size(); i++) {
+      //    bs.writeUn(8, lut2[k][i]);
+      //  }
+      //}
+    }
+    bs.byteAlign();
+    remove((params->folderPath + "hprior.bin").c_str());
+    remove((params->folderPath + "hprior.txt").c_str());
+
+    clock_user.stop();
+    double bpp = double(8 * payload.size())
+      / reconCloud->cloud
+          .getPointCount();  // bpop, but the final reconCloud is not here. Same issue for the positions and attributes.
+    std::cout << "lut bitstream size " << payload.size() << " B (" << bpp
+              << " bpp)\n";
+
+    auto total_user = std::chrono::duration_cast<std::chrono::milliseconds>(
+      clock_user.count());
+    std::cout << "lut processing time (user): " << total_user.count() / 1000.0
+              << " s" << std::endl;
+    callback->onOutputBuffer(payload);
+  }
+
   // Apply global scaling to reconstructed point cloud
-  if (reconCloud)
+  if (postProcessReconCloud) {
+    if (lut1.size() > 0) {
+      bool fastRecolor = true;
+      PCCPointSet3 m_pointCloudReconE = reconCloud->cloud;
+      int L =
+        std::ceil(std::log(1 / double(_sps->seqGeomScale)) / std::log(2)) - 1;
+      double s = 1 / double(_sps->seqGeomScale) / std::pow(2, L);
+      std::vector<int> neighs1 = get_neighbours(
+        m_pointCloudReconE, params->seq_num_neighbors_for_1st_prior);
+      robin_hood::unordered_map<int, int> recon_lut1 =
+        reconLUT2(m_pointCloudReconE, lut1, neighs1);
+      m_pointCloudReconE =
+        PUM2(m_pointCloudReconE, recon_lut1, neighs1, fastRecolor);
+      robin_hood::unordered_map<int, int> recon_lut2;
+      if (lut2.size()) {
+        for (int k = 1; k < K; k++) {
+          std::vector<int> neighs2 = get_neighbours(m_pointCloudReconE, 6);
+          recon_lut2 = reconLUT2(m_pointCloudReconE, lut2[K - 1 - k], neighs2);
+          m_pointCloudReconE =
+            PUM2(m_pointCloudReconE, recon_lut2, neighs2, fastRecolor);
+        }
+      }
+      if (L + 1 - K > 0) {
+        for (int i = 0; i < m_pointCloudReconE.getPointCount(); i++) {
+          m_pointCloudReconE[i] = m_pointCloudReconE[i] * (1 << (L + 1 - K));
+        }
+      }
+      int idx = 0;
+      for (int i = 0; i < m_pointCloudReconE.getPointCount(); i++) {
+        m_pointCloudReconE[idx] = m_pointCloudReconE[i];
+        if (fastRecolor) {
+          if (m_pointCloudReconE.hasColors()) {
+            m_pointCloudReconE.setColor(idx, m_pointCloudReconE.getColor(i));
+          }
+          if (m_pointCloudReconE.hasReflectances()) {
+            m_pointCloudReconE.setReflectance(
+              idx, m_pointCloudReconE.getReflectance(i));
+          }
+        }
+        idx += 1;
+      }
+      m_pointCloudReconE.resize(idx);
+      //if (!fastRecolor) {
+      //  //params->recolour.numNeighboursFwd = 1;  // changed for recolour Post
+      //  for (const auto& attr_sps : _sps->attributeSets) {
+      //    // No need for Bwd? It may be bad for the recolour when the reference point cloud is the downsampled one.
+      //    //recolourPost(
+      //    recolour(
+      //      attr_sps, params->recolour, reconCloud->cloud,
+      //      1 / double(_sps->seqGeomScale), Vec3<int>{0}, &m_pointCloudReconE); // TODO: params->recolour needed to be encoded or also be specified in the decoder
+      //  }
+      //}
+      reconCloud->cloud = m_pointCloudReconE;
+      m_pointCloudReconE.clear();
+      lut1.clear();
+      lut2.clear();
+    }
+    ////de-quantilization would occur during ply::write if lut1.size() = 0
     scaleGeometry(
       reconCloud->cloud, _sps->globalScale, reconCloud->outputFpBits);
+  }
 
   return 0;
 }
@@ -431,6 +750,9 @@ PCCTMC3Encoder3::deriveParameterSets(EncoderParams* params)
   //
   // NB: seq_geom_scale is the reciprocal of unit length
   params->sps.seqGeomScale = params->seqGeomScale / params->extGeomScale;
+
+  params->sps.seq_max_num_pcs_in_pyramid_minus1 =
+    params->seq_max_num_pcs_in_pyramid_minus1;
 
   // Global scaling converts from the coded scale to the sequence scale
   // NB: globalScale is constrained, eg 1.1 is not representable
@@ -560,6 +882,28 @@ PCCTMC3Encoder3::fixupParameterSets(EncoderParams* params)
   }
 }
 
+
+//---------------------------------------------------------------------------
+// motion parameter derivation
+// Setup the block sizes b
+void
+PCCTMC3Encoder3::deriveMotionParams(EncoderParams* params)
+{
+  auto scaleFactor = params->codedGeomScale;
+  params->interGeom.th_dist = int(1000 * scaleFactor);
+  params->gbh.motion_block_size = {0, 0, 0};
+  for (int i = 0; i < 3; i++) {
+    if (params->interGeom.motion_block_size[i] > 0)
+      params->gbh.motion_block_size[i] = std::max(
+        64,
+        int(std::round(params->interGeom.motion_block_size[i] * scaleFactor)));
+    else
+      params->gbh.motion_block_size[i] = 0;
+  }
+  params->interGeom.motion_window_size = std::max(
+    2, int(std::round(params->interGeom.motion_window_size * scaleFactor)));
+}
+
 //----------------------------------------------------------------------------
 
 void
@@ -620,6 +964,8 @@ PCCTMC3Encoder3::compressPartition(
     std::cout << "positions bitstream size " << payload.size() << " B (" << bpp
               << " bpp)\n";
 
+    geomBits += 8 * payload.size();  //
+
     auto total_user = std::chrono::duration_cast<std::chrono::milliseconds>(
       clock_user.count());
     std::cout << "positions processing time (user): "
@@ -676,6 +1022,9 @@ PCCTMC3Encoder3::compressPartition(
     abh.attr_layer_qp_delta_luma = attr_enc.abh.attr_layer_qp_delta_luma;
     abh.attr_layer_qp_delta_chroma = attr_enc.abh.attr_layer_qp_delta_chroma;
 
+    if(_gbh.interPredictionEnabledFlag)
+      abh.attr_qp_delta_luma = attr_aps.qpShiftStep;
+
     // NB: regionQpOrigin/regionQpSize use the STV axes, not XYZ.
     if (false) {
       abh.qpRegions.emplace_back();
@@ -685,10 +1034,14 @@ PCCTMC3Encoder3::compressPartition(
       region.attr_region_qp_offset = {0, 0};
       abh.attr_region_bits_minus1 = -1
         + numBits(
-            std::max(region.regionOrigin.max(), region.regionSize.max()));
+          std::max(region.regionOrigin.max(), region.regionSize.max()));
     }
     // Number of regions is constrained to at most 1.
     assert(abh.qpRegions.size() <= 1);
+    
+    abh.disableAttrInterPred = !movingState;
+    attrInterPredParams.enableAttrInterPred = attr_aps.attrInterPredictionEnabled & !abh.disableAttrInterPred;
+    abh.attrInterPredSearchRange = attr_aps.attrInterPredSearchRange;
 
     // Convert cartesian positions to spherical for use in attribute coding.
     // NB: this retains the original cartesian positions to restore afterwards
@@ -697,9 +1050,26 @@ PCCTMC3Encoder3::compressPartition(
       // If predgeom was used, re-use the internal positions rather than
       // calculating afresh.
       Box3<int> bboxRpl;
+
+      pcc::point_t minPos = 0;
+
       if (_gps->predgeom_enabled_flag) {
         altPositions = _posSph;
         bboxRpl = Box3<int>(altPositions.begin(), altPositions.end());
+        minPos = bboxRpl.min;
+        if (attrInterPredParams.enableAttrInterPred) {
+          for (auto i = 0; i < 3; i++)
+            minPos[i] = minPos[i] < minPos_ref[i] ? minPos[i] : minPos_ref[i];
+          auto minPos_shift = minPos_ref - minPos;
+
+          if (minPos_shift[0] || minPos_shift[1] || minPos_shift[2])
+            offsetAndScaleShift(
+              minPos_shift, attr_aps.attr_coord_scale,
+              &attrInterPredParams.referencePointCloud[0],
+              &attrInterPredParams.referencePointCloud[0]
+                + attrInterPredParams.getPointCount());
+        }
+        minPos_ref = minPos;
       } else {
         altPositions.resize(pointCloud.getPointCount());
 
@@ -708,10 +1078,15 @@ PCCTMC3Encoder3::compressPartition(
           laserOrigin, _gps->angularTheta.data(), _gps->angularTheta.size(),
           &pointCloud[0], &pointCloud[0] + pointCloud.getPointCount(),
           altPositions.data());
+
+        if(!attr_aps.attrInterPredictionEnabled){
+          minPos = bboxRpl.min;
+        }
       }
 
       offsetAndScale(
-        bboxRpl.min, attr_aps.attr_coord_scale, altPositions.data(),
+        minPos, attr_aps.attr_coord_scale, altPositions.data(),      
+        //bboxRpl.min, attr_aps.attr_coord_scale, altPositions.data(),
         altPositions.data() + altPositions.size());
 
       pointCloud.swapPoints(altPositions);
@@ -729,13 +1104,39 @@ PCCTMC3Encoder3::compressPartition(
     // replace the attribute encoder if not compatible
     if (!attrEncoder->isReusable(attr_aps, abh))
       attrEncoder = makeAttributeEncoder();
+    
+	if (!attr_aps.spherical_coord_flag)
+      for (auto i = 0; i < pointCloud.getPointCount(); i++)
+        pointCloud[i] += _sliceOrigin; 
 
     auto& ctxtMemAttr = _ctxtMemAttrs.at(abh.attr_sps_attr_idx);
     attrEncoder->encode(
-      *_sps, attr_sps, attr_aps, abh, ctxtMemAttr, pointCloud, &payload);
+      *_sps, attr_sps, attr_aps, abh, ctxtMemAttr, pointCloud, &payload, attrInterPredParams);
 
-    if (attr_aps.spherical_coord_flag)
+    if (!attr_aps.spherical_coord_flag)
+      for (auto i = 0; i < pointCloud.getPointCount(); i++)
+        pointCloud[i] -= _sliceOrigin;    
+
+    if (attr_aps.spherical_coord_flag){
       pointCloud.swapPoints(altPositions);
+    }
+
+    if(attr_aps.spherical_coord_flag){
+      attrInterPredParams.referencePointCloud = pointCloud;
+      attrInterPredParams.referencePointCloud.swapPoints(altPositions);     
+    }
+    else{
+      attrInterPredParams.referencePointCloud.clear();
+    }
+
+    if(!attrInterPredParams.getPointCount())
+    {
+      attrInterPredParams.referencePointCloud = pointCloud;
+      for (int count = 0; count < attrInterPredParams.referencePointCloud.getPointCount(); count++) {
+        attrInterPredParams.referencePointCloud[count] += _sliceOrigin;
+      }
+    }
+
 
     clock_user.stop();
 
@@ -753,6 +1154,14 @@ PCCTMC3Encoder3::compressPartition(
     callback->onOutputBuffer(payload);
   }
 
+  if (_gps->interPredictionEnabledFlag) {
+    if (_gps->predgeom_enabled_flag){
+      _refFrameSph.insert(_posSph);
+    }
+    else
+      predPointCloud = pointCloud;
+  }
+
   // Note the current slice id for loss detection with entropy continuation
   _prevSliceId = _sliceId;
 
@@ -763,6 +1172,11 @@ PCCTMC3Encoder3::compressPartition(
 
   if (reconCloud)
     appendSlice(reconCloud->cloud);
+  for (int count = 0; count < predPointCloud.getPointCount(); count++) {
+    // In decoder, the reconstructed is stored without a shift of _sliceOrigin. To avoide mismatch, encoder should do the same.
+    predPointCloud[count] += _sliceOrigin;
+  }
+
 }
 
 //----------------------------------------------------------------------------
@@ -786,9 +1200,27 @@ PCCTMC3Encoder3::encodeGeometryBrick(
   gbh.geom_stream_cnt_minus1 = params->gbh.geom_stream_cnt_minus1;
   gbh.trisoup_node_size_log2_minus2 =
     params->gbh.trisoup_node_size_log2_minus2;
-
+  gbh.trisoup_vertex_quantization_bits =
+    params->gbh.trisoup_vertex_quantization_bits;
+  gbh.trisoup_centroid_vertex_residual_flag =
+    params->gbh.trisoup_centroid_vertex_residual_flag;
+  gbh.trisoup_halo_flag =
+    params->gbh.trisoup_halo_flag;
+  gbh.trisoup_adaptive_halo_flag =
+    params->gbh.trisoup_adaptive_halo_flag;
+  gbh.trisoup_fine_ray_tracing_flag =
+    params->gbh.trisoup_fine_ray_tracing_flag;
+  gbh.interPredictionEnabledFlag = _codeCurrFrameAsInter;
   gbh.geom_qp_offset_intvl_log2_delta =
     params->gbh.geom_qp_offset_intvl_log2_delta;
+
+  gbh.gm_matrix = {65536, 0, 0, 0, 65536, 0, 0, 0, 65536};
+  gbh.gm_trans = 0;
+  gbh.gm_thresh = {0, 0};
+  if (gbh.interPredictionEnabledFlag && !_gps->predgeom_enabled_flag) {
+    gbh.lpu_type = params->interGeom.lpuType;
+    gbh.motion_block_size = params->gbh.motion_block_size;
+  }
 
   // Entropy continuation is not permitted in the first slice of a frame
   gbh.entropy_continuation_flag = false;
@@ -827,31 +1259,68 @@ PCCTMC3Encoder3::encodeGeometryBrick(
 
   // forget (reset) all saved context state at boundary
   if (!gbh.entropy_continuation_flag) {
-    _ctxtMemOctreeGeom->reset();
-    _ctxtMemPredGeom->reset();
+    if (
+      !_gps->gof_geom_entropy_continuation_enabled_flag
+      || !gbh.interPredictionEnabledFlag) {
+      _ctxtMemOctreeGeom->reset();
+      _ctxtMemPredGeom->reset();
+    }
     for (auto& ctxtMem : _ctxtMemAttrs)
       ctxtMem.reset();
   }
 
-  if (_gps->predgeom_enabled_flag)
+  if (_gps->predgeom_enabled_flag) {
+    _refFrameSph.setInterEnabled(gbh.interPredictionEnabledFlag);
     encodePredictiveGeometry(
-      params->predGeom, *_gps, gbh, pointCloud, &_posSph, *_ctxtMemPredGeom,
-      arithmeticEncoders[0].get());
-  else if (!_gps->trisoup_enabled_flag)
+      params->predGeom, *_gps, gbh, pointCloud, &_posSph, _refFrameSph,
+      *_ctxtMemPredGeom, arithmeticEncoders[0].get());
+  } else if (!_gps->trisoup_enabled_flag) {
     encodeGeometryOctree(
       params->geom, *_gps, gbh, pointCloud, *_ctxtMemOctreeGeom,
-      arithmeticEncoders);
-  else {
+      arithmeticEncoders, predPointCloud, *_sps,
+      params->interGeom);
+  }
+  else
+  {
     // limit the number of points to the slice limit
     // todo(df): this should be derived from the level
     gbh.footer.geom_num_points_minus1 = params->partition.sliceMaxPoints - 1;
     encodeGeometryTrisoup(
-      params->geom, *_gps, gbh, pointCloud, *_ctxtMemOctreeGeom,
-      arithmeticEncoders);
+      params->trisoup, params->geom, *_gps, gbh, pointCloud,
+      *_ctxtMemOctreeGeom, arithmeticEncoders, predPointCloud,
+      *_sps, params->interGeom);
   }
 
   // signal the actual number of points coded
   gbh.footer.geom_num_points_minus1 = pointCloud.getPointCount() - 1;
+
+  if (
+    _gps->predgeom_enabled_flag && gbh.interPredictionEnabledFlag
+    && _gps->globalMotionEnabled)
+    _refFrameSph.getMotionParams(gbh.gm_thresh, gbh.gm_matrix, gbh.gm_trans);
+
+  attrInterPredParams.frameDistance = 1;
+  movingState = false;
+
+  if(gbh.interPredictionEnabledFlag){
+    const double scale = 65536.;  
+    const double thr1_pre = 0.1 / attrInterPredParams.frameDistance;
+    const double thr2_pre = params->attrInterPredTranslationThreshold;
+
+    const double thr1_tan_pre = tan(M_PI * thr1_pre / 180);
+    const double thr1_sin_pre = sin(M_PI * thr1_pre / 180);
+    
+    double Rx,Ry,Rz,Sx,Sy,Sz;
+
+    Rx = std::abs((gbh.gm_matrix[5] / scale) / (1. + gbh.gm_matrix[8] / scale));
+    Ry = std::abs(gbh.gm_matrix[2] / scale);
+    Rz = std::abs((gbh.gm_matrix[1] / scale) / (1. + gbh.gm_matrix[0] / scale));
+    Sx = std::abs(gbh.gm_trans[0]);
+    Sy = std::abs(gbh.gm_trans[1]);
+    Sz = std::abs(gbh.gm_trans[2]);
+
+    movingState =(Rx < thr1_tan_pre && Ry < thr1_sin_pre && Rz < thr1_tan_pre && Sx < thr2_pre && Sy < thr2_pre && Sz < thr2_pre);
+  }
 
   // assemble data unit
   //  - record the position of each aec buffer for chunk concatenation
@@ -892,9 +1361,16 @@ PCCTMC3Encoder3::appendSlice(PCCPointSet3& accumCloud)
 {
   // offset current point cloud to be in coding coordinate system
   size_t numPoints = pointCloud.getPointCount();
-  for (size_t i = 0; i < numPoints; i++)
-    for (int k = 0; k < 3; k++)
-      pointCloud[i][k] += _sliceOrigin[k];
+  if (_sps->seq_max_num_pcs_in_pyramid_minus1) {
+    for (size_t i = 0; i < numPoints; i++)
+      for (int k = 0; k < 3; k++)
+        pointCloud[i][k] +=
+          _sliceOrigin[k] + _sps->seqBoundingBoxOrigin[k];  //
+  } else {
+    for (size_t i = 0; i < numPoints; i++)
+      for (int k = 0; k < 3; k++)
+        pointCloud[i][k] += _sliceOrigin[k];  //
+  }  
 
   accumCloud.append(pointCloud);
 }
@@ -903,8 +1379,9 @@ PCCTMC3Encoder3::appendSlice(PCCPointSet3& accumCloud)
 // translates and scales inputPointCloud, storing the result in
 // this->pointCloud for use by the encoding process.
 
-SrcMappedPointSet
-PCCTMC3Encoder3::quantization(const PCCPointSet3& src)
+std::vector<SrcMappedPointSet>
+PCCTMC3Encoder3::quantization(
+  const PCCPointSet3& src, int seq_max_num_pcs_in_pyramid_minus1)
 {
   // Currently the sequence bounding box size must be set
   assert(_sps->seqBoundingBoxSize != Vec3<int>{0});
@@ -913,20 +1390,114 @@ PCCTMC3Encoder3::quantization(const PCCPointSet3& src)
   // and quantisation.
   Box3<int32_t> clampBox(0, std::numeric_limits<int32_t>::max());
 
+   std::vector<SrcMappedPointSet> ret;
+
   // When using predictive geometry, sub-sample the point cloud and let
   // the predictive geometry coder quantise internally.
-  if (_inputDecimationScale != 1.)
-    return samplePositionsUniq(
-      _inputDecimationScale, _srcToCodingScale, _originInCodingCoords, src);
+   if (_inputDecimationScale != 1.) {
+     ret.push_back(samplePositionsUniq(
+       _inputDecimationScale, _srcToCodingScale, _originInCodingCoords, src));
+     return ret;
+   }
 
-  if (_gps->geom_unique_points_flag)
-    return quantizePositionsUniq(
-      _srcToCodingScale, _originInCodingCoords, clampBox, src);
+   if (_gps->geom_unique_points_flag) {
+     if (seq_max_num_pcs_in_pyramid_minus1 == 0) {
+       ret.push_back(quantizePositionsUniq(
+         _srcToCodingScale, _originInCodingCoords, clampBox, src));
+     } else {
+       int L = std::ceil(std::log(1 / _srcToCodingScale) / std::log(2)) - 1;
+       if (1) {  // TODO: when _numGeomCoffAdjust > 0 or =0
+         ret.push_back(quantizePositionsUniqWithoutOffset(
+           1.0 / (1 << (_numGeomCoffAdjust)), clampBox, src));
+       }
+       for (int k = 1; k <= L - _numGeomCoffAdjust; k++) {
+         SrcMappedPointSet temp =
+           quantizePositionsUniqWithoutOffset(0.5, clampBox, ret[k - 1].cloud);
+         std::vector<int> idxToSrcIdx, srcIdxDupList;
+         idxToSrcIdx.resize(temp.idxToSrcIdx.size());
+         srcIdxDupList.resize(ret[k - 1].srcIdxDupList.size());
+         for (int i = 0; i < temp.idxToSrcIdx.size(); i++) {
+           int prevIdx, srcIdx = temp.idxToSrcIdx[i];
+           idxToSrcIdx[i] = ret[k - 1].idxToSrcIdx[srcIdx];
+           int prevIdx2, srcIdx2;
+           std::map<int, int> idxToSrcIdxMap;
+           do {
+             prevIdx = srcIdx;
+             srcIdx2 = ret[k - 1].idxToSrcIdx[srcIdx];
+             do {
+               prevIdx2 = srcIdx2;
+               idxToSrcIdxMap.insert({prevIdx2, 0});
+               srcIdx2 = ret[k - 1].srcIdxDupList[srcIdx2];
+             } while (srcIdx2 != prevIdx2);
+             int idx = 0;
+             int savedSrcIdx;
+             for (auto iter = idxToSrcIdxMap.rbegin();
+                  iter != idxToSrcIdxMap.rend(); iter++) {
+               if (idx == 0) {
+                 srcIdxDupList[iter->first] = iter->first;
+               } else {
+                 srcIdxDupList[iter->first] = savedSrcIdx;
+               }
+               savedSrcIdx = iter->first;
+               idx += 1;
+             }
+             srcIdx = temp.srcIdxDupList[srcIdx];
+           } while (srcIdx != prevIdx);
+         }
+         temp.srcIdxDupList = srcIdxDupList;
+         temp.idxToSrcIdx = idxToSrcIdx;
+         ret.push_back(temp);
+       }
+       int K = std::max(1, L - _numGeomCoffAdjust + 1);
+       SrcMappedPointSet temp = quantizePositionsUniq(
+         _srcToCodingScale * (1 << L), _originInCodingCoords, clampBox,
+         ret[K - 1].cloud);
+       std::vector<int> idxToSrcIdx, srcIdxDupList;
+       idxToSrcIdx.resize(temp.idxToSrcIdx.size());
+       srcIdxDupList.resize(ret[K - 1].srcIdxDupList.size());
+       for (int i = 0; i < temp.idxToSrcIdx.size(); i++) {
+         int prevIdx, srcIdx = temp.idxToSrcIdx[i];
+         idxToSrcIdx[i] = ret[K - 1].idxToSrcIdx[srcIdx];
+         int prevIdx2, srcIdx2;
+         std::map<int, int> idxToSrcIdxMap;
+         do {
+           prevIdx = srcIdx;
+           srcIdx2 = ret[K - 1].idxToSrcIdx[srcIdx];
+           do {
+             prevIdx2 = srcIdx2;
+             idxToSrcIdxMap.insert({prevIdx2, 0});
+             srcIdx2 = ret[K - 1].srcIdxDupList[srcIdx2];
+           } while (srcIdx2 != prevIdx2);
+           int idx = 0;
+           int savedSrcIdx;
+           for (
+             auto iter = idxToSrcIdxMap.rbegin();
+             iter != idxToSrcIdxMap.rend();
+             iter++) {  // https://en.cppreference.com/w/cpp/container/map/rbegin
+             if (idx == 0) {
+               srcIdxDupList[iter->first] = iter->first;
+             } else {
+               srcIdxDupList[iter->first] = savedSrcIdx;
+             }
+             savedSrcIdx = iter->first;
+             idx += 1;
+           }
+           srcIdx = temp.srcIdxDupList[srcIdx];
+         } while (srcIdx != prevIdx);
+       }
+       temp.srcIdxDupList = srcIdxDupList;
+       temp.idxToSrcIdx = idxToSrcIdx;
+       ret.push_back(temp);
+     }
+     return ret;
+   }
 
   SrcMappedPointSet dst;
   quantizePositions(
     _srcToCodingScale, _originInCodingCoords, clampBox, src, &dst.cloud);
-  return dst;
+
+  ret.push_back(dst);
+  return ret;
 }
 
 //----------------------------------------------------------------------------

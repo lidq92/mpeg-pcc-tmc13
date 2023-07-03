@@ -43,7 +43,8 @@
 #include "entropy.h"
 #include "hls.h"
 #include "partitioning.h"
-
+#include "geometry_predictive.h"
+#include "TMC3.h"
 namespace pcc {
 
 //============================================================================
@@ -59,14 +60,19 @@ void encodeGeometryOctree(
   GeometryBrickHeader& gbh,
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
-  std::vector<std::unique_ptr<EntropyEncoder>>& arithmeticEncoder);
+  std::vector<std::unique_ptr<EntropyEncoder>>& arithmeticEncoder,
+  PCCPointSet3& predPointCloud,
+  const SequenceParameterSet& sps,
+  const InterGeomEncOpts& interParams);
 
 void decodeGeometryOctree(
   const GeometryParameterSet& gps,
   const GeometryBrickHeader& gbh,
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
-  EntropyDecoder& arithmeticDecoder);
+  EntropyDecoder& arithmeticDecoder,
+  PCCPointSet3& predPointCloud,
+  const Vec3<int> minimum_position);
 
 void decodeGeometryOctreeScalable(
   const GeometryParameterSet& gps,
@@ -74,24 +80,31 @@ void decodeGeometryOctreeScalable(
   int minGeomNodeSizeLog2,
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
-  EntropyDecoder& arithmeticDecoder);
+  EntropyDecoder& arithmeticDecoder,
+  PCCPointSet3& predPointCloud);
 
 //----------------------------------------------------------------------------
 
 void encodeGeometryTrisoup(
-  const OctreeEncOpts& opt,
+  const TrisoupEncOpts& opt,
+  const OctreeEncOpts& optOctree,
   const GeometryParameterSet& gps,
   GeometryBrickHeader& gbh,
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
-  std::vector<std::unique_ptr<EntropyEncoder>>& arithmeticEncoder);
+  std::vector<std::unique_ptr<EntropyEncoder>>& arithmeticEncoder,
+  PCCPointSet3& predPointCloud,
+  const SequenceParameterSet& sps,
+  const InterGeomEncOpts& interParams);
 
 void decodeGeometryTrisoup(
   const GeometryParameterSet& gps,
   const GeometryBrickHeader& gbh,
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
-  EntropyDecoder& arithmeticDecoder);
+  EntropyDecoder& arithmeticDecoder,
+  PCCPointSet3& predPointCloud,
+  const Vec3<int> minimum_position);
 
 //----------------------------------------------------------------------------
 
@@ -101,6 +114,7 @@ void encodePredictiveGeometry(
   GeometryBrickHeader& gbh,
   PCCPointSet3& pointCloud,
   std::vector<Vec3<int32_t>>* reconPosSph,
+  PredGeomPredictor& refFrameSph,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder);
 
@@ -109,6 +123,7 @@ void decodePredictiveGeometry(
   const GeometryBrickHeader& gbh,
   PCCPointSet3& pointCloud,
   std::vector<Vec3<int32_t>>* reconPosSph,
+  PredGeomPredictor& refFrameSph,
   PredGeomContexts& ctxtMem,
   EntropyDecoder& arithmeticDecoder);
 

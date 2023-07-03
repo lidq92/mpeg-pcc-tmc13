@@ -37,6 +37,7 @@
 
 #include <functional>
 #include <map>
+#include <bitset>
 
 #include "Attribute.h"
 #include "PayloadBuffer.h"
@@ -46,6 +47,7 @@
 #include "framectr.h"
 #include "geometry.h"
 #include "hls.h"
+#include "pointset_processing.h"
 
 namespace pcc {
 
@@ -62,6 +64,15 @@ struct DecoderParams {
 
   // Number of fractional bits used in output position representation.
   int outputFpBits;
+
+  // attribute recolouring parameters
+  RecolourParams recolour;
+
+  //
+  int seq_num_neighbors_for_1st_prior;
+
+  // 
+  std::string folderPath;
 };
 
 //============================================================================
@@ -89,11 +100,13 @@ public:
   void storeTileInventory(TileInventory&& inventory);
 
   //==========================================================================
+  void setMotionVectorFileName(std::string s) { motionVectorFileName = s; }
 
 private:
   void activateParameterSets(const AttributeParamInventoryHdr& gbh);
   void activateParameterSets(const GeometryBrickHeader& gbh);
   int decodeGeometryBrick(const PayloadBuffer& buf);
+  int decodeLUT(const PayloadBuffer& buf);
   void decodeAttributeBrick(const PayloadBuffer& buf);
   void decodeConstantAttribute(const PayloadBuffer& buf);
   bool dectectFrameBoundary(const PayloadBuffer* buf);
@@ -134,9 +147,22 @@ private:
   // The accumulated decoded slices
   PCCPointSet3 _accumCloud;
 
+  // LUT
+  std::vector<int> lut1;
+  std::vector<std::vector<int>> lut2;
+  int geomBits;
+
+  // The inverse mapped point cloud
+  PCCPointSet3 Vu;
+
+
   // The current output cloud
   CloudFrame _outCloud;
 
+  // The reference pointcloud buffer (a one entry buffer) that may be
+  // used to predict a frame.
+  PCCPointSet3 _refPointCloud;
+ 
   // Point positions in spherical coordinates of the current slice
   std::vector<point_t> _posSph;
 
@@ -162,6 +188,14 @@ private:
 
   // Attribute decoder for reuse between attributes of same slice
   std::unique_ptr<AttributeDecoderIntf> _attrDecoder;
+
+  // Point positions in spherical coordinates of the reference frame
+  PredGeomPredictor _refFrameSph;
+  std::string motionVectorFileName;
+
+  AttributeInterPredParams attrInterPredParams;
+
+  pcc::point_t minPos_ref;
 };
 
 //----------------------------------------------------------------------------

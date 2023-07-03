@@ -71,3 +71,13 @@ mpeg-pcc-tmc13$ make -f $PWD/scripts/Makefile.tmc13-step \
   [md5sum]  Ford_01_vox1mm-0100.ply.bin.decoded.ply.md5
   [metric]  Ford_01_vox1mm-0100.ply.bin.decoded.ply.pc_error <- Ford_01_vox1mm-0100.ply.bin.decoded.ply
 ```
+
+## Intra and inter prediction
+
+The yaml files stored directly under the cfg/ folder correspond to intra prediction, and yaml files stored under cfg/inter/ folder correspond to inter prediction. The gen-cfg.sh script is updated such that intra/inter prediction may be specified as an additional option to produce the configuration files corresponding to intra/inter prediction; alternately, the "--all" option may be used to generate the configuration for intra and inter prediction for all tool configurations.
+
+After running the gen-cfg.sh script, the configuration files for intra and inter prediction are generated in separate folders. The configuration files corresponding to inter prediction are generated in folders with "-inter" suffix. For example, configuration files corresponding to octree and predicting/lifting transform using intra prediction are generated in the folder octree-predlift/ (as was the case in some earlier versions of the test model), and configuration files corresponding to octree and predicting/lifting transform using inter prediction are generated in the folder octree-predlift-inter/.
+
+
+
+

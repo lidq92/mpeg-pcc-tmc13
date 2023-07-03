@@ -36,6 +36,8 @@
 #pragma once
 
 #include "PCCMath.h"
+#include "PCCPointSet.h"
+
 #include <cstdint>
 #include <ostream>
 #include <vector>
@@ -56,6 +58,7 @@ enum class PayloadType
   kConstantAttribute = 7,
   kGeneralizedAttrParamInventory = 8,
   kUserData = 9,
+  kLUTData = 10,
 };
 
 //============================================================================
@@ -366,7 +369,10 @@ struct SequenceParameterSet {
   Vec3<int> seqBoundingBoxSize;
 
   // A value describing the scaling of the source positions prior to encoding.
-  Rational seqGeomScale;
+  Rational seqGeomScale;  
+  
+  // seq_max_num_pcs_in_pyramid_minus1
+  int seq_max_num_pcs_in_pyramid_minus1;
 
   // Indicates that units used to interpret seqGeomScale.
   ScaleUnit seq_geom_scale_unit_flag;
@@ -420,6 +426,36 @@ struct SequenceParameterSet {
 
   // Indicates that context state may be propagated between slices.
   bool entropy_continuation_enabled_flag;
+};
+
+//============================================================================
+
+struct RahtPredictionParams {
+  bool raht_prediction_enabled_flag;
+  int raht_prediction_threshold0;
+  int raht_prediction_threshold1;
+  bool raht_prediction_skip1_flag;
+  bool raht_subnode_prediction_enabled_flag;
+  std::vector<int> raht_prediction_weights;
+
+  std::vector<int> predWeightParent;
+  std::vector<int> predWeightChild;
+
+  RahtPredictionParams()
+  {
+    predWeightParent = {4, 2, 2, 2, 1, 1, 1, 1, 1, 2,
+                        1, 2, 2, 1, 1, 1, 1, 1, 1};
+  }
+  void setPredictionWeights()
+  {
+    auto& w = raht_prediction_weights;
+    predWeightChild = {w[4], w[4], w[3], w[4], w[3], w[3],
+                       w[4], w[4], w[4], w[4], w[4], w[4]};
+
+    predWeightParent = {w[0], w[1], w[1], w[1], w[2], w[2], w[2],
+                        w[2], w[2], w[1], w[2], w[1], w[1], w[2],
+                        w[2], w[2], w[2], w[2], w[2]};
+  }
 };
 
 //============================================================================
@@ -489,13 +525,19 @@ struct GeometryParameterSet {
 
   // Controls the use of planar mode
   bool geom_planar_mode_enabled_flag;
+  bool geom_octree_depth_planar_eligibiity_enabled_flag;
+  bool geom_multiple_planar_mode_enable_flag;
   int geom_planar_threshold0;
   int geom_planar_threshold1;
   int geom_planar_threshold2;
   int geom_idcm_rate_minus1;
+  bool geom_planar_disabled_idcm_angular_flag;
 
   // Enables angular coding in octree/predgeom
   bool geom_angular_mode_enabled_flag;
+
+  // Enables disabling residual2 in lossy predtree geometry coding
+  bool residual2_disabled_flag;
 
   // Indicates whether the angualed origin is signalled in the gps or slice
   bool geom_slice_angular_origin_present_flag;
@@ -536,6 +578,19 @@ struct GeometryParameterSet {
 
   // Quantize azimuth residuals in algular predictive geometry coder.
   bool azimuth_scaling_enabled_flag;
+  // Enable octree angular extension
+  bool octree_angular_extension_flag;
+  // Maximum prediction index to be used in the prediction list
+  int predgeom_max_pred_index;
+  // Radius residual threshold to add new predictor in the prediction list
+  int predgeom_radius_threshold_for_pred_list;
+  // Enable inter prediction
+  bool interPredictionEnabledFlag;
+  int interAzimScaleLog2;
+  bool globalMotionEnabled;
+
+  //Permits entropy continuation enabled in GoF for inter frame coding
+  bool gof_geom_entropy_continuation_enabled_flag;
 };
 
 //============================================================================
@@ -630,6 +685,22 @@ struct GeometryBrickHeader {
   // Number of bits to represent num_unique_segments_minus1
   int num_unique_segments_bits_minus1;
 
+  // Number of bits used to quantize vertex positioning in a node
+  // 0 means same number of bits as trisoupNodeSizeLog2
+  int trisoup_vertex_quantization_bits;
+
+  // Indicates if a residual is encoded for centroid vertex of a trisoup node
+  bool trisoup_centroid_vertex_residual_flag;
+
+  // Indicates if the trisoup halo is enabled or not
+  bool trisoup_halo_flag;
+
+  // Indicates if the trisoup halo is adaptive or not
+  bool trisoup_adaptive_halo_flag;
+
+  // Indicates if fine ray tracing must be used for trisoup nodes
+  bool trisoup_fine_ray_tracing_flag;
+
   // 'Header' information that appears at the end of the data unit
   GeometryBrickFooter footer;
 
@@ -641,6 +712,16 @@ struct GeometryBrickHeader {
 
   // minimum radius for predictive geometry coding with angular mode
   int pgeom_min_radius;
+
+  // Enable inter prediction
+  bool interPredictionEnabledFlag;
+
+  std::vector<int> gm_matrix;
+  Vec3<int> gm_trans;
+  std::pair<int, int> gm_thresh;
+  std::vector<int> motion_block_size;
+  int lpu_type;
+  bool min_zero_origin_flag;
 };
 
 //============================================================================
@@ -661,13 +742,14 @@ struct AttributeParameterSet {
 
   LodDecimationMethod lod_decimation_type;
   bool canonical_point_order_flag;
+  int max_points_per_sort_log2_plus1;
   int num_pred_nearest_neighbours_minus1;
   int max_num_direct_predictors;
   bool direct_avg_predictor_disabled_flag;
   int adaptive_prediction_threshold;
   int intra_lod_search_range;
   int inter_lod_search_range;
-
+  bool predictionWithDistributionEnabled;
   // Neighbour contribution weights used to calculate quantization weights
   Vec3<uint32_t> quant_neigh_weight;
 
@@ -715,9 +797,7 @@ struct AttributeParameterSet {
   bool aps_slice_qp_deltas_present_flag;
 
   //--- raht parameters
-  bool raht_prediction_enabled_flag;
-  int raht_prediction_threshold0;
-  int raht_prediction_threshold1;
+  RahtPredictionParams rahtPredParams;
 
   //--- lifting parameters
   bool scalable_lifting_enabled_flag;
@@ -732,6 +812,10 @@ struct AttributeParameterSet {
 
   // Whether raw attribute are coded as fixed width or variable length.
   bool raw_attr_variable_len_flag;
+
+  bool attrInterPredictionEnabled;
+  int attrInterPredSearchRange;
+  int qpShiftStep;
 };
 
 //============================================================================
@@ -806,6 +890,10 @@ struct AttributeBrickHeader {
   int attr_region_bits_minus1;
 
   int32_t attr_dist2_delta;
+
+  int attrInterPredSearchRange;
+
+  bool disableAttrInterPred;
 };
 
 //============================================================================

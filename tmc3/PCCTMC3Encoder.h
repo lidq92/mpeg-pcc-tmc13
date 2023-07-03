@@ -39,6 +39,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <bitset>
 
 #include "Attribute.h"
 #include "PayloadBuffer.h"
@@ -50,7 +51,7 @@
 #include "hls.h"
 #include "partitioning.h"
 #include "pointset_processing.h"
-
+#include "TMC3.h"
 namespace pcc {
 
 //============================================================================
@@ -106,8 +107,14 @@ struct EncoderParams {
   // Encoder specific parameters for geometry
   OctreeEncOpts geom;
 
+  // Encoder specific parameters for trisoup
+  TrisoupEncOpts trisoup;
+
   // Options for the predictive geometry coder
   PredGeomEncOpts predGeom;
+
+  // Options for geometry interprediction
+  InterGeomEncOpts interGeom;
 
   // Parameters that control partitioning
   PartitionParams partition;
@@ -139,6 +146,25 @@ struct EncoderParams {
   // precision expected for attributes after scaling with predgeom
   // and spherical coordinates
   int attrSphericalMaxLog2;
+
+  // Period of random access points (managed by SequenceEncoder)
+  int randomAccessPeriod;
+
+  // Maximum translation threshold used to disable attr inter pred
+  double attrInterPredTranslationThreshold;
+  
+  //
+  int rate_point;
+
+  //
+  int seq_max_num_pcs_in_pyramid_minus1;
+
+  //
+  int seq_num_neighbors_for_1st_prior;
+
+  // 
+  std::string folderPath;
+
 };
 
 //============================================================================
@@ -158,7 +184,8 @@ public:
     const PCCPointSet3& inputPointCloud,
     EncoderParams* params,
     Callbacks*,
-    CloudFrame* reconstructedCloud = nullptr);
+    CloudFrame* reconstructedCloud = nullptr,
+    bool postProcessReconCloud = false);
 
   void compressPartition(
     const PCCPointSet3& inputPointCloud,
@@ -169,13 +196,17 @@ public:
 
   static void deriveParameterSets(EncoderParams* params);
   static void fixupParameterSets(EncoderParams* params);
+  void setInterForCurrPic(bool x) { _codeCurrFrameAsInter = x; }
+  void setMotionVectorFileName(std::string s) { motionVectorFileName = s; }
+  static void deriveMotionParams(EncoderParams* params);
 
 private:
   void appendSlice(PCCPointSet3& cloud);
 
   void encodeGeometryBrick(const EncoderParams*, PayloadBuffer* buf);
 
-  SrcMappedPointSet quantization(const PCCPointSet3& src);
+  std::vector<SrcMappedPointSet>
+  quantization(const PCCPointSet3& src, int seq_max_num_pcs_in_pyramid_minus1);
 
 private:
   PCCPointSet3 pointCloud;
@@ -192,6 +223,9 @@ private:
 
   // Scale factor that defines coding coordinate system
   double _srcToCodingScale;
+
+  // 
+  int _numGeomCoffAdjust;
 
   // Sequence origin in terms of coding coordinate system
   Vec3<int> _originInCodingCoords;
@@ -231,6 +265,25 @@ private:
   std::unique_ptr<PredGeomContexts> _ctxtMemPredGeom;
   std::vector<AttributeContexts> _ctxtMemAttrs;
   std::vector<int> _ctxtMemAttrSliceIds;
+  // Code current picture as inter prediction
+  bool _codeCurrFrameAsInter;
+  // Point positions in spherical coordinates of the reference frame
+  PredGeomPredictor _refFrameSph;
+  std::string motionVectorFileName;
+
+  AttributeInterPredParams attrInterPredParams;
+  bool movingState;
+
+  pcc::point_t minPos_ref;
+  // Point cloud that acts as a predictor of @pointCloud's geometry
+  // occupancy.
+  PCCPointSet3 predPointCloud;
+
+  // LUT
+  std::vector<int> lut1;
+  std::vector<std::vector<int>> lut2;
+  int geomBits;
+
 };
 
 //----------------------------------------------------------------------------

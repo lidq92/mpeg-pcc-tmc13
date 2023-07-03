@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <climits>
 
 #include "PCCMisc.h"
 #include "geometry_params.h"
@@ -77,8 +78,7 @@ oneQtBtDecision(
     if (
       (nodeMinDimLog2 <= maxNodeMinDimLog2ToSplitZ
        && nodeSizeLog2[2] >= nodeXYMaxDimLog2 + maxDiffToSplitZ)
-      || (nodeXYMaxDimLog2 >= maxNodeMinDimLog2ToSplitZ + maxDiffToSplitZ
-          && nodeSizeLog2[2] >= nodeXYMaxDimLog2))
+      || (nodeXYMaxDimLog2 >= maxNodeMinDimLog2ToSplitZ + maxDiffToSplitZ && nodeSizeLog2[2] >= nodeXYMaxDimLog2))
       nodeSizeLog2[2]--;
   } else  // octree partition
     nodeSizeLog2 = nodeSizeLog2 - 1;
@@ -158,69 +158,6 @@ mkQtBtNodeSizeList(
 
   return nodeSizeLog2List;
 }
-
-//-------------------------------------------------------------------------
-// map the @occupancy pattern bits to take into account symmetries in the
-// neighbour configuration @neighPattern.
-//
-uint8_t
-mapGeometryOccupancy(uint8_t occupancy, uint8_t neighPattern)
-{
-  switch (kOccMapRotateZIdFromPatternXY[neighPattern & 15]) {
-  case 1: occupancy = kOccMapRotateZ090[occupancy]; break;
-  case 2: occupancy = kOccMapRotateZ180[occupancy]; break;
-  case 3: occupancy = kOccMapRotateZ270[occupancy]; break;
-  }
-
-  bool flag_ud = (neighPattern & 16) && !(neighPattern & 32);
-  if (flag_ud) {
-    occupancy = kOccMapMirrorXY[occupancy];
-  }
-
-  if (kOccMapRotateYIdFromPattern[neighPattern]) {
-    occupancy = kOccMapRotateY270[occupancy];
-  }
-
-  switch (kOccMapRotateXIdFromPattern[neighPattern]) {
-  case 1: occupancy = kOccMapRotateX090[occupancy]; break;
-  case 2: occupancy = kOccMapRotateX270Y180[occupancy]; break;
-  case 3: occupancy = kOccMapRotateX090Y180[occupancy]; break;
-  }
-
-  return occupancy;
-}
-
-//-------------------------------------------------------------------------
-// map the @occupancy pattern bits to take into account symmetries in the
-// neighbour configuration @neighPattern.
-//
-uint8_t
-mapGeometryOccupancyInv(uint8_t occupancy, uint8_t neighPattern)
-{
-  switch (kOccMapRotateXIdFromPattern[neighPattern]) {
-  case 1: occupancy = kOccMapRotateX270[occupancy]; break;
-  case 2: occupancy = kOccMapRotateX270Y180[occupancy]; break;
-  case 3: occupancy = kOccMapRotateX090Y180[occupancy]; break;
-  }
-
-  if (kOccMapRotateYIdFromPattern[neighPattern]) {
-    occupancy = kOccMapRotateY090[occupancy];
-  }
-
-  bool flag_ud = (neighPattern & 16) && !(neighPattern & 32);
-  if (flag_ud) {
-    occupancy = kOccMapMirrorXY[occupancy];
-  }
-
-  switch (kOccMapRotateZIdFromPatternXY[neighPattern & 15]) {
-  case 1: occupancy = kOccMapRotateZ270[occupancy]; break;
-  case 2: occupancy = kOccMapRotateZ180[occupancy]; break;
-  case 3: occupancy = kOccMapRotateZ090[occupancy]; break;
-  }
-
-  return occupancy;
-}
-
 //============================================================================
 // Derive the neighbour pattern for the three siblings of a node
 // from the parent's occupancy byte.
@@ -368,8 +305,8 @@ OctreePlanarBuffer::OctreePlanarBuffer() = default;
 OctreePlanarBuffer::OctreePlanarBuffer(OctreePlanarBuffer&& rhs) = default;
 OctreePlanarBuffer::~OctreePlanarBuffer() = default;
 
-OctreePlanarBuffer& OctreePlanarBuffer::
-operator=(OctreePlanarBuffer&& rhs) = default;
+OctreePlanarBuffer&
+OctreePlanarBuffer::operator=(OctreePlanarBuffer&& rhs) = default;
 
 //----------------------------------------------------------------------------
 // :: Copying the planar buffer
@@ -436,7 +373,8 @@ OctreePlanarState::OctreePlanarState(const GeometryParameterSet& gps)
 {
   _planarBufferEnabled =
     gps.geom_planar_mode_enabled_flag && !gps.planar_buffer_disabled_flag;
-
+  _geom_multiple_planar_mode_enable_flag = gps.geom_planar_mode_enabled_flag
+    && gps.geom_multiple_planar_mode_enable_flag;
   _rateThreshold[0] = gps.geom_planar_threshold0 << 4;
   _rateThreshold[1] = gps.geom_planar_threshold1 << 4;
   _rateThreshold[2] = gps.geom_planar_threshold2 << 4;
@@ -448,8 +386,8 @@ OctreePlanarState::initPlanes(const Vec3<int>& depthXyz)
   if (!_planarBufferEnabled)
     return;
 
-  Vec3<int> numBufferRows = {1 << depthXyz[0], 1 << depthXyz[1],
-                             1 << depthXyz[2]};
+  Vec3<int> numBufferRows = {
+    1 << depthXyz[0], 1 << depthXyz[1], 1 << depthXyz[2]};
   _planarBuffer.resize(numBufferRows);
 }
 

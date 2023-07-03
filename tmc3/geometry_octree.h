@@ -36,7 +36,7 @@
 #pragma once
 
 #include <cstdint>
-
+#  include <cstring>
 #include "DualLutCoder.h"
 #include "PCCMath.h"
 #include "PCCPointSet.h"
@@ -46,7 +46,7 @@
 #include "quantization.h"
 #include "ringbuf.h"
 #include "tables.h"
-
+#include "TMC3.h"
 namespace pcc {
 
 //============================================================================
@@ -66,6 +66,14 @@ struct PCCOctree3Node {
   // The current node's number of siblings plus one.
   // ie, the number of child nodes present in this node's parent.
   uint8_t numSiblingsPlus1;
+
+  // Range of prediction's point indexes spanned by node
+  uint32_t predStart;
+  uint32_t predEnd;
+
+  // The number of mispredictions in determining the occupancy
+  // map of the child nodes in this node's parent.
+  int8_t numSiblingsMispredicted;
 
   // The occupancy map used describing the current node and its siblings.
   uint8_t siblingOccupancy;
@@ -88,16 +96,22 @@ struct OctreeNodePlanar {
   uint8_t planarPossible = 7;
   uint8_t planePosBits = 0;
   uint8_t planarMode = 0;
+
+  bool isPCM = false;
+  bool isSignaled = false;
+  bool isRead = false;
+
+  bool allowPCM = true;
+  bool isPreDirMatch = true;
+  int lastDirIdx = 0;
+
+  bool eligible[3] = {false, false, false};
+  int ctxBufPCM = 0;
 };
 
 //---------------------------------------------------------------------------
 
 int neighPatternFromOccupancy(int pos, int occupancy);
-
-//---------------------------------------------------------------------------
-
-uint8_t mapGeometryOccupancy(uint8_t occupancy, uint8_t neighPattern);
-uint8_t mapGeometryOccupancyInv(uint8_t occupancy, uint8_t neighPattern);
 
 //---------------------------------------------------------------------------
 // Determine if a node is a leaf node based on size.
@@ -128,9 +142,15 @@ isDirectModeEligible(
   int nodeSizeLog2,
   int nodeNeighPattern,
   const PCCOctree3Node& node,
-  const PCCOctree3Node& child)
+  const PCCOctree3Node& child,
+  bool occupancyIsPredictable,
+  bool isAngularModeEnabled
+
+)
 {
   if (!intensity)
+    return false;
+  if (occupancyIsPredictable && !isAngularModeEnabled)
     return false;
 
   if (intensity == 1)
@@ -150,6 +170,25 @@ isDirectModeEligible(
   return false;
 }
 
+inline bool
+isDirectModeEligible_Inter(
+  int intensity,
+  int nodeSizeLog2,
+  int nodeNeighPattern,
+  const PCCOctree3Node& node,
+  const PCCOctree3Node& child,
+  bool occupancyIsPredictable)
+{
+  if (!intensity)
+    return false;
+
+  if (occupancyIsPredictable)
+    return false;
+
+  return (nodeSizeLog2 >= 2) && (nodeNeighPattern == 0)
+    && (child.numSiblingsPlus1 == 1) && (node.numSiblingsPlus1 <= 2);
+}
+
 //---------------------------------------------------------------------------
 // Select the neighbour pattern reduction table according to GPS config.
 
@@ -160,18 +199,6 @@ neighPattern64toR1(const GeometryParameterSet& gps)
     return kNeighPattern64to9;
   return kNeighPattern64to6;
 }
-
-//---------------------------------------------------------------------------
-
-struct CtxModelOctreeOccupancy {
-  AdaptiveBitModelFast contexts[256];
-  static const int kCtxFactorShift = 3;
-
-  AdaptiveBitModelFast& operator[](int idx)
-  {
-    return contexts[idx >> kCtxFactorShift];
-  }
-};
 
 //---------------------------------------------------------------------------
 // Encapsulates the derivation of ctxIdx for occupancy coding.
@@ -215,12 +242,201 @@ CtxMapOctreeOccupancy::evolve(bool bit, uint8_t* ctxIdx)
   uint8_t retval = *ctxIdx;
 
   if (bit)
-    *ctxIdx += kCtxMapOctreeOccupancyDelta[(255 - *ctxIdx) >> 4];
+    *ctxIdx += kCtxMapDynamicOBUFDelta[(255 - *ctxIdx) >> 4];
   else
-    *ctxIdx -= kCtxMapOctreeOccupancyDelta[*ctxIdx >> 4];
+    *ctxIdx -= kCtxMapDynamicOBUFDelta[*ctxIdx >> 4];
 
   return retval;
 }
+
+//============================================================================
+
+
+struct CtxModelOctreeOccupancy {
+  static const int kCtxFactorShift = 4;
+  AdaptiveBitModelFast contexts[256 >> kCtxFactorShift];
+
+  AdaptiveBitModelFast& operator[](int idx)
+  {
+    return contexts[idx >> kCtxFactorShift];
+  }
+};
+
+//---------------------------------------------------------------------------
+
+struct CtxModelDynamicOBUF {
+  static const int kCtxFactorShift = 3;
+  AdaptiveBitModelFast contexts[256 >> kCtxFactorShift];
+
+  AdaptiveBitModelFast& operator[](int idx)
+  {
+    return contexts[idx >> kCtxFactorShift];
+  }
+};
+
+
+//============================================================================
+
+class CtxMapDynamicOBUF {
+public:
+  int S1 = 0; // 16;
+  int S2 = 0; // 128 * 2 * 8;
+
+  uint8_t* CtxIdxMap; // S1*S2
+  uint8_t* kDown; // S2
+  uint8_t* Nseen; // S2
+
+  //  allocate and reset CtxIdxMap to 127
+  void reset(int userBitS1, int userBitS2);
+
+  //  deallocate CtxIdxMap
+  void clear();
+
+  //  decode bit  and update *ctxIdx according to bit
+  int decodeEvolve(
+    EntropyDecoder* _arithmeticDecoder,
+    CtxModelDynamicOBUF& _ctxMapOccupancy,
+    int i,
+    int j);
+
+  //  get and update *ctxIdx according to bit
+  uint8_t getEvolve(bool bit, int i, int j);
+
+private:
+  int maxTreeDepth = 3;
+  int minkTree = 0;
+
+  //  update kDown
+  void  decreaseKdown(int iP, int j, int iTree, int kDown0, int  kTree);
+  int idx(int i, int j);
+};
+
+inline void
+CtxMapDynamicOBUF::reset(int userBitS1, int userBitS2)
+{
+  S1 = 1 << userBitS1;
+  S2 = 1 << userBitS2;
+  maxTreeDepth = userBitS1 - 3;
+
+  minkTree = userBitS1 - maxTreeDepth;
+
+  kDown = new uint8_t[(1 << maxTreeDepth) * S2];
+  std::memset(kDown, userBitS1, sizeof * kDown * (1 << maxTreeDepth) * S2);
+  Nseen = new uint8_t[(1 << maxTreeDepth) * S2];
+  std::memset(Nseen, 0, sizeof * Nseen * (1 << maxTreeDepth) * S2);
+  CtxIdxMap = new uint8_t[S1 * S2];
+  std::memset(CtxIdxMap, 127, sizeof * CtxIdxMap * S1 * S2);
+}
+
+inline void
+CtxMapDynamicOBUF::clear()
+{
+  if (!S1 || !S2)
+    return;
+
+  delete[] kDown ;
+  delete[] Nseen;
+  delete[] CtxIdxMap;
+}
+
+inline int
+CtxMapDynamicOBUF::decodeEvolve(
+  EntropyDecoder* _arithmeticDecoder,
+  CtxModelDynamicOBUF& _ctxMapOccupancy,
+  int i,
+  int j)
+{
+  int iTree = i >> minkTree;
+  int kDown0 = kDown[idx(iTree, j)];
+  int iP = (i >> kDown0) << kDown0;
+  uint8_t* ctxIdx = &(CtxIdxMap[idx(iP, j)]);
+
+  int bit = _arithmeticDecoder->decode(_ctxMapOccupancy[*ctxIdx]);
+
+  if (bit)
+    *ctxIdx += kCtxMapDynamicOBUFDelta[(255 - *ctxIdx) >> 4];
+  else
+    *ctxIdx -= kCtxMapDynamicOBUFDelta[*ctxIdx >> 4];
+
+  if (kDown0) {
+    int kTree = std::max(0, kDown0 - minkTree);
+    iTree = (iTree >> kTree) << kTree;
+    int th = 3 + (std::abs(int(*ctxIdx) - 127) >> 4);
+    if (++Nseen[idx(iTree, j)]>= th)  // if more than th stats per pack
+      decreaseKdown(iP, j, iTree, kDown0, kTree);
+  }
+
+  return bit;
+}
+
+
+inline uint8_t
+CtxMapDynamicOBUF::getEvolve(bool bit, int i, int j)
+{
+  int iTree = i >> minkTree;
+  int kDown0 = kDown[idx(iTree, j)];
+  int iP = (i >> kDown0) << kDown0;
+
+  uint8_t* ctxIdx = &(CtxIdxMap[idx(iP, j)]);
+  uint8_t out = *ctxIdx;
+
+  if (bit)
+    *ctxIdx += kCtxMapDynamicOBUFDelta[(255 - *ctxIdx) >> 4];
+  else
+    *ctxIdx -= kCtxMapDynamicOBUFDelta[*ctxIdx >> 4];
+
+  if (kDown0) {
+    int kTree = std::max(0, kDown0 - minkTree);
+    iTree = (iTree >> kTree) << kTree;
+    int th = 3 + (std::abs(int(*ctxIdx) - 127) >> 4);
+    if (++Nseen[idx(iTree, j)]>= th)  // if more than th stats per pack
+      decreaseKdown(iP, j, iTree, kDown0, kTree);
+  }
+
+  return out;
+}
+
+inline void
+CtxMapDynamicOBUF::decreaseKdown(
+  int iP,
+  int j,
+  int iTree,
+  int kDown0,
+  int kTree)
+{
+  int idxTree = idx(iTree, j);
+  Nseen[idxTree] = 0; // setting other Nseen unneeded because initialized to 0
+  if (kTree) { // binary-tree based dynamic OBUF
+    int iEnd = S2 << kTree;
+    for (int ii = 0; ii < iEnd; ii += S2)
+      kDown[idxTree + ii]--;
+
+    auto *p = &CtxIdxMap[idx(iP, j)];
+    p[S2 << kDown0 - 1] = *p;
+  }
+  else {
+    // simple dynamic OBUF on a subblock of states attached to a leaf of
+    // binary-tree
+    kDown[idxTree]--;
+
+    int S1Simple = S1 >> maxTreeDepth;
+    int SS1 = (S1Simple >> kDown0) ;
+    int stride = S2 << kDown0;
+
+    auto *p = &CtxIdxMap[idx(iTree << minkTree, j)];
+    for (int iL = 0; iL < SS1; iL++, p += stride)  // pack
+      p[stride >> 1] = *p;
+  }
+}
+
+inline int
+CtxMapDynamicOBUF::idx(int i, int j)
+{
+  return i * S2 + j;
+}
+
+
+
 
 //---------------------------------------------------------------------------
 // generate an array of node sizes according to subsequent qtbt decisions
@@ -331,29 +547,6 @@ OctreeAngPosScaler::scaleNs(Vec3<int32_t> pos) const
 
 //============================================================================
 
-class AzimuthalPhiZi {
-public:
-  AzimuthalPhiZi(int numLasers, const std::vector<int>& numPhi)
-    : _delta(numLasers), _invDelta(numLasers)
-  {
-    for (int laserIndex = 0; laserIndex < numLasers; laserIndex++) {
-      constexpr int k2pi = 6588397;  // 2**20 * 2 * pi
-      _delta[laserIndex] = k2pi / numPhi[laserIndex];
-      _invDelta[laserIndex] =
-        int64_t((int64_t(numPhi[laserIndex]) << 30) / k2pi);
-    }
-  }
-
-  const int delta(size_t idx) const { return _delta[idx]; }
-  const int64_t invDelta(size_t idx) const { return _invDelta[idx]; }
-
-private:
-  std::vector<int> _delta;
-  std::vector<int64_t> _invDelta;
-};
-
-//============================================================================
-
 struct OctreePlanarBuffer {
   static constexpr unsigned numBitsC = 14;
   static constexpr unsigned numBitsAb = 5;
@@ -411,6 +604,7 @@ struct OctreePlanarState {
   OctreePlanarState& operator=(OctreePlanarState&&);
 
   bool _planarBufferEnabled;
+  bool _geom_multiple_planar_mode_enable_flag;
   OctreePlanarBuffer _planarBuffer;
 
   std::array<int, 3> _rate{{128 * 8, 128 * 8, 128 * 8}};
@@ -446,6 +640,14 @@ int determineContextAngleForPlanar(
   int* contextAnglePhiY,
   Vec3<uint32_t> quantMasks);
 
+//---------------------------------------------------------------------------
+
+inline int
+determineContextIndexForAngularPhiIDCM(int deltaPhi, int phiLRDiff)
+{
+  return (3 * deltaPhi < phiLRDiff << 2) + (deltaPhi < phiLRDiff << 1);
+}
+
 //----------------------------------------------------------------------------
 
 int findLaser(point_t point, const int* thetaList, const int numTheta);
@@ -458,6 +660,7 @@ public:
 
 protected:
   AdaptiveBitModel _ctxSingleChild;
+  AdaptiveBitModel _ctxZ[8][7][4];
 
   AdaptiveBitModel _ctxDupPointCntGt0;
   AdaptiveBitModel _ctxDupPointCntGt1;
@@ -473,30 +676,43 @@ protected:
   AdaptiveBitModel _ctxSameBitHighz[5];
 
   // residual laser index
-  AdaptiveBitModel _ctxThetaRes[3];
-  AdaptiveBitModel _ctxThetaResSign;
+  AdaptiveBitModel _ctxThetaRes[2][3];
+  AdaptiveBitModel _ctxThetaResSign[3];
   AdaptiveBitModel _ctxThetaResExp;
+
+  // residual z
+  AdaptiveBitModel _ctxZRes[3];
+  AdaptiveBitModel _ctxZResSign;
+  AdaptiveBitModel _ctxZResExp;
 
   AdaptiveBitModel _ctxQpOffsetAbsGt0;
   AdaptiveBitModel _ctxQpOffsetSign;
   AdaptiveBitModel _ctxQpOffsetAbsEgl;
 
   // for planar mode xyz
-  AdaptiveBitModel _ctxPlanarMode[3];
-  AdaptiveBitModel _ctxPlanarPlaneLastIndex[3][3][4];
-  AdaptiveBitModel _ctxPlanarPlaneLastIndexZ[3];
-  AdaptiveBitModel _ctxPlanarPlaneLastIndexAngular[4];
+  AdaptiveBitModel _ctxMultiPlanarMode;
+  AdaptiveBitModel _ctxPlanarCopyMode[16][8];
+  AdaptiveBitModel _ctxPlanarMode[9];
+  AdaptiveBitModel _ctxPlanarPlaneLastIndex[3][3][3][4];
+  AdaptiveBitModel _ctxPlanarPlaneLastIndexZ[9];
+
+  AdaptiveBitModel _ctxPlanarPlaneLastIndexAngular[3][4];
   AdaptiveBitModel _ctxPlanarPlaneLastIndexAngularIdcm[4];
 
-  AdaptiveBitModel _ctxPlanarPlaneLastIndexAngularPhi[8];
-  AdaptiveBitModel _ctxPlanarPlaneLastIndexAngularPhiIDCM[8];
+  AdaptiveBitModel _ctxPlanarPlaneLastIndexAngularPhi[3][8];
+
+  AdaptiveBitModel _ctxPlanarPlaneLastIndexAngularPhiIDCM[8][3];
 
   // For bitwise occupancy coding
   CtxModelOctreeOccupancy _ctxOccupancy;
-  CtxMapOctreeOccupancy _ctxIdxMaps[18];
+  CtxMapOctreeOccupancy _ctxIdxMaps[24];
 
   // For bytewise occupancy coding
   DualLutCoder<true> _bytewiseOccupancyCoder[10];
+  // OBUF somplified
+  CtxMapDynamicOBUF _MapOccupancy[4][8];
+  CtxMapDynamicOBUF _MapOccupancySparse[4][8];
+  CtxModelDynamicOBUF _CtxMapDynamicOBUF;
 };
 
 //----------------------------------------------------------------------------
@@ -518,7 +734,10 @@ void encodeGeometryOctree(
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
   std::vector<std::unique_ptr<EntropyEncoder>>& arithmeticEncoders,
-  pcc::ringbuf<PCCOctree3Node>* nodesRemaining);
+  pcc::ringbuf<PCCOctree3Node>* nodesRemaining,
+  PCCPointSet3& predPointCloud,
+  const SequenceParameterSet& sps,
+  const InterGeomEncOpts& interParams);
 
 void decodeGeometryOctree(
   const GeometryParameterSet& gps,
@@ -527,8 +746,11 @@ void decodeGeometryOctree(
   PCCPointSet3& pointCloud,
   GeometryOctreeContexts& ctxtMem,
   EntropyDecoder& arithmeticDecoder,
-  pcc::ringbuf<PCCOctree3Node>* nodesRemaining);
+  pcc::ringbuf<PCCOctree3Node>* nodesRemaining,
+  PCCPointSet3& predPointCloud,
+  const Vec3<int> minimum_position
 
+);
 //============================================================================
 
 }  // namespace pcc

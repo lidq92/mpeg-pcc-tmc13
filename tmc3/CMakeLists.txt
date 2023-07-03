@@ -15,7 +15,7 @@ check_symbol_exists(getrusage sys/resource.h HAVE_GETRUSAGE)
 # Fallback to descriptive version if VCS unavailable
 #  NB: the "unconfirmed-" part refers to this being a fallback option
 #      and the reported version may or may not be accurate.
-set(VERSION_FALLBACK "unconfirmed-release-14.0")
+set(VERSION_FALLBACK "unconfirmed-release-20.0-rc1")
 set(VERSION_FILE ${CMAKE_CURRENT_BINARY_DIR}/version.cpp)
 set(VERSION_FILE_IN ${CMAKE_CURRENT_SOURCE_DIR}/version.cpp.in)
 set(VERSION_CACHE_FILE ${CMAKE_CURRENT_BINARY_DIR}/version.cache)
@@ -96,6 +96,7 @@ file(GLOB PROJECT_INC_FILES
   "hls.h"
   "io_hls.h"
   "io_tlv.h"
+  "motionWip.h"
   "osspecific.h"
   "partitioning.h"
   "pcc_chrono.h"
@@ -109,6 +110,8 @@ file(GLOB PROJECT_INC_FILES
   "../dependencies/nanoflann/*.h"
   "../dependencies/program-options-lite/*.h"
   "../dependencies/schroedinger/schroarith.h"
+  "ari.h"
+  "robin_hood.h"
 )
 
 file(GLOB PROJECT_CPP_FILES
@@ -138,6 +141,7 @@ file(GLOB PROJECT_CPP_FILES
   "io_hls.cpp"
   "io_tlv.cpp"
   "misc.cpp"
+  "motionWip.cpp"
   "osspecific.cpp"
   "partitioning.cpp"
   "pcc_chrono.cpp"

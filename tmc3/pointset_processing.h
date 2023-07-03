@@ -39,6 +39,7 @@
 
 #include "PCCPointSet.h"
 #include "hls.h"
+#include "robin_hood.h"
 
 namespace pcc {
 
@@ -104,6 +105,9 @@ SrcMappedPointSet quantizePositionsUniq(
   const Vec3<int> offset,
   const Box3<int> clamp,
   const PCCPointSet3& src);
+
+SrcMappedPointSet quantizePositionsUniqWithoutOffset(
+  const float scaleFactor, const Box3<int> clamp, const PCCPointSet3& src);
 
 //============================================================================
 // Quantise the geometry of a point cloud, retaining duplicate points.
@@ -176,8 +180,22 @@ bool recolourColour(
 // clouds, is handled according to:
 //    posInTgt = posInSrc * sourceToTargetScaleFactor - targetToSourceOffset
 
+bool recolourColourPost(
+  const PCCPointSet3& pointCloudOrg,
+  double geomQuanStep,
+  point_t quanOffset,
+  PCCPointSet3& pointCloudRec);
+
 bool recolourReflectance(
   const AttributeDescription& desc,
+  const RecolourParams& cfg,
+  const PCCPointSet3& source,
+  double sourceToTargetScaleFactor,
+  point_t targetToSourceOffset,
+  PCCPointSet3& target);
+
+bool recolourReflectancePost(
+  const AttributeDescription& attrDesc,
   const RecolourParams& cfg,
   const PCCPointSet3& source,
   double sourceToTargetScaleFactor,
@@ -199,6 +217,14 @@ int recolour(
   point_t tgtToSrcOffset,
   PCCPointSet3* target);
 
+int recolourPost(
+  const AttributeDescription& desc,
+  const RecolourParams& cfg,
+  const PCCPointSet3& source,
+  float sourceToTargetScaleFactor,
+  point_t tgtToSrcOffset,
+  PCCPointSet3* target);
+
 //============================================================================
 
 void convertGbrToYCbCrBt709(PCCPointSet3&);
@@ -210,8 +236,26 @@ void convertYCgCoRToGbr(int bitDepth, PCCPointSet3&);
 //============================================================================
 
 // Generate index order sorted by azimuth angle.
-std::vector<int32_t> orderByAzimuth(
-  PCCPointSet3&, int start, int end, int numDigit, Vec3<int32_t> origin);
+std::vector<int>
+orderByAzimuth(
+  PCCPointSet3& cloud,
+  int start,
+  int end,
+  double recipBinWidth,
+  Vec3<int32_t> origin);
+
+std::vector<int>
+orderByAzimuth(
+  PCCPointSet3& cloud,
+  int start,
+  int end,
+  double recipBinWidth,
+  Vec3<int32_t> origin,
+  const int32_t positionAzimuthScaleLog2,
+  const int32_t azimuthSpeed,
+  const std::vector<int32_t>& angularTheta,
+  const std::vector<int32_t>& angularZ
+  );
 
 std::vector<int32_t>
 orderByRadius(PCCPointSet3&, int start, int end, Vec3<int32_t> origin);
@@ -220,12 +264,26 @@ std::vector<int32_t> orderByLaserAngle(
   PCCPointSet3&, int start, int end, int numDigit, Vec3<int32_t> origin);
 
 // Sorts points according to azimuth angle.
-void sortByAzimuth(
-  PCCPointSet3&,
+void
+sortByAzimuth(
+  PCCPointSet3& cloud,
   int start,
   int end,
   double recipBinWidth,
   Vec3<int32_t> origin = 0);
+
+void
+sortByAzimuth(
+  PCCPointSet3& cloud,
+  int start,
+  int end,
+  double recipBinWidth,
+  Vec3<int32_t> origin,
+  const int32_t positionAzimuthScaleLog2,
+  const int32_t azimuthSpeed,
+  const std::vector<int32_t>& angularTheta,
+  const std::vector<int32_t>& angularZ
+  );
 
 void sortByRadius(PCCPointSet3&, int start, int end, Vec3<int32_t> origin = 0);
 
@@ -235,6 +293,32 @@ void sortByLaserAngle(
   int end,
   double recipBinWidth,
   Vec3<int32_t> origin = 0);
+
+robin_hood::unordered_map<int64_t, int> occupancy(const PCCPointSet3& Vp);
+
+
+std::vector<int> get_children2(const PCCPointSet3& Vp, const PCCPointSet3& V);
+
+std::vector<int> get_neighbours(const PCCPointSet3& Vp, const int n_neighbors);
+
+std::vector<int> buildLUT2(
+  const PCCPointSet3& Vp,
+  const PCCPointSet3& V,
+  const std::vector<int>& uncles);
+
+std::tuple<std::vector<int>, std::vector<int>>
+get_num_childs(const PCCPointSet3& Vd, const float s);
+
+robin_hood::unordered_map<int, int> reconLUT2(
+  const PCCPointSet3& Vd,
+  const std::vector<int>& lut_values,
+  const std::vector<int>& neighs);
+
+PCCPointSet3 PUM2(
+  const PCCPointSet3& m_pointCloudQuant,
+  robin_hood::unordered_map<int, int>& lut,
+  const std::vector<int>& neighs,
+  const bool fastRecolor = true);
 
 //============================================================================
 

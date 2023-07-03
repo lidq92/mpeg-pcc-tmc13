@@ -52,6 +52,8 @@ sequences:
 
   # temporal sequences (Reflectance only)
   ford_01_q1mm:
+    zero_motion_file: 'zeroMotion-ford-01-global-motion-matrix.txt'
+    global_motion_file: 'ford_01_q1mm-global-motion-matrix-estimated.txt'
     src-dir: Ford_01_q_1mm
     src: Ford_01_vox1mm-{0100..1599}.ply
     first-frame: 100
@@ -60,6 +62,7 @@ sequences:
     group: cat3-frame
     src-geometry-precision: 18
     src-unit-metres: 0.001
+    lidar-type: spinning
     numLasers: 64
     lasersTheta: >
       -0.461611, -0.451281, -0.440090, -0.430000, -0.418945, -0.408667,
@@ -105,6 +108,8 @@ sequences:
      - resolution: 30000
 
   ford_02_q1mm:
+    zero_motion_file: 'zeroMotion-ford-02-global-motion-matrix.txt'
+    global_motion_file: 'ford_02_q1mm-global-motion-matrix-estimated.txt'
     src-dir: Ford_02_q_1mm
     src: Ford_02_vox1mm-{0100..1599}.ply
     first-frame: 100
@@ -113,6 +118,7 @@ sequences:
     group: cat3-frame
     src-geometry-precision: 18
     src-unit-metres: 0.001
+    lidar-type: spinning
     numLasers: 64
     lasersTheta: >
       -0.461611, -0.451281, -0.440090, -0.430000, -0.418945, -0.408667,
@@ -158,6 +164,8 @@ sequences:
      - resolution: 30000
 
   ford_03_q1mm:
+    zero_motion_file: 'zeroMotion-ford-03-global-motion-matrix.txt'
+    global_motion_file: 'ford_03_q1mm-global-motion-matrix-estimated.txt'
     src-dir: Ford_03_q_1mm
     src: Ford_03_vox1mm-{0200..1699}.ply
     first-frame: 200
@@ -166,6 +174,7 @@ sequences:
     group: cat3-frame
     src-geometry-precision: 18
     src-unit-metres: 0.001
+    lidar-type: spinning
     numLasers: 64
     lasersTheta: >
       -0.461611, -0.451281, -0.440090, -0.430000, -0.418945, -0.408667,
@@ -211,6 +220,8 @@ sequences:
      - resolution: 30000
 
   qnxadas-junction-approach:
+    zero_motion_file: 'zeroMotion-qnx-approach-global-motion-matrix.txt'
+    global_motion_file: 'qnxadas-junction-approach-global-motion-matrix-estimated.txt'
     src-dir: qnxadas-junction-approach
     src: '{000001..000074}.ply'
     norm-dir: qnxadas-junction-approach
@@ -221,6 +232,7 @@ sequences:
     group: cat3-frame
     src-geometry-precision: 18
     src-unit-metres: 0.001
+    lidar-type: spinning
     numLasers: 16
     lasersTheta: >
       -0.268099, -0.230939, -0.194419, -0.158398, -0.122788, -0.087491,
@@ -246,6 +258,8 @@ sequences:
      - resolution: 30000
 
   qnxadas-junction-exit:
+    zero_motion_file: 'zeroMotion-qnx-exit-global-motion-matrix.txt'
+    global_motion_file: 'qnxadas-junction-exit-global-motion-matrix-estimated.txt'
     src-dir: qnxadas-junction-exit
     src: '{000001..000074}.ply'
     norm-dir: qnxadas-junction-exit
@@ -256,6 +270,7 @@ sequences:
     group: cat3-frame
     src-geometry-precision: 18
     src-unit-metres: 0.001
+    lidar-type: spinning
     numLasers: 16
     lasersTheta: >
       -0.268099, -0.230939, -0.194419, -0.158398, -0.122788, -0.087491,
@@ -281,6 +296,8 @@ sequences:
      - resolution: 30000
 
   qnxadas-motorway-join:
+    zero_motion_file: 'zeroMotion-qnx-join-global-motion-matrix.txt'
+    global_motion_file: 'qnxadas-motorway-join-global-motion-matrix-estimated.txt'
     src-dir: qnxadas-motorway-join
     src: '{000001..000500}.ply'
     norm-dir: qnxadas-motorway-join
@@ -291,6 +308,7 @@ sequences:
     group: cat3-frame
     src-geometry-precision: 18
     src-unit-metres: 0.001
+    lidar-type: spinning
     numLasers: 16
     lasersTheta: >
       -0.268099, -0.230939, -0.194419, -0.158398, -0.122788, -0.087491,
@@ -316,6 +334,8 @@ sequences:
      - resolution: 30000
 
   qnxadas-navigating-bends:
+    zero_motion_file: 'zeroMotion-qnx-bends-global-motion-matrix.txt'
+    global_motion_file: 'qnxadas-navigating-bends-global-motion-matrix-estimated.txt'
     src-dir: qnxadas-navigating-bends
     src: '{000001..000300}.ply'
     norm-dir: qnxadas-navigating-bends
@@ -326,6 +346,7 @@ sequences:
     group: cat3-frame
     src-geometry-precision: 18
     src-unit-metres: 0.001
+    lidar-type: spinning
     numLasers: 16
     lasersTheta: >
       -0.268099, -0.230939, -0.194419, -0.158398, -0.122788, -0.087491,
@@ -349,3 +370,72 @@ sequences:
      - seqSizeWhd: '262143, 262143, 262143'
     pcerrorflags:
      - resolution: 30000
+
+  innovizQC1:
+    global_motion_file: 'gps-innovizqc1-matrix.txt'
+    src-dir: InnovizQC1
+    src: '{0000..0299}.ply'
+    first-frame: 0
+    frame-rate: 15
+    num-frames: 300
+    group: cat3-frame
+    src-geometry-precision: 16
+    src-unit-metres: 0.01
+    lidar-type: non-spinning
+    seq_lod: 10
+    seq_lod_bias: '1,1,8'
+    has_refl: 1
+    bitdepth_refl: 8
+    encflags:
+     # fix the size of the bounding box to align frames for predictive coding
+     - autoSeqBbox: 0
+     - seqOrigin: '-32768, -32768, -32768'
+     - seqSizeWhd: '65535, 65535, 65535'
+    pcerrorflags:
+     - resolution: 3000
+
+  innovizQC2:
+    global_motion_file: 'gps-innovizqc2-matrix.txt'
+    src-dir: InnovizQC2
+    src: '{0000..0299}.ply'
+    first-frame: 0
+    frame-rate: 15
+    num-frames: 300
+    group: cat3-frame
+    src-geometry-precision: 16
+    src-unit-metres: 0.01
+    lidar-type: non-spinning
+    seq_lod: 10
+    seq_lod_bias: '1,1,8'
+    has_refl: 1
+    bitdepth_refl: 8
+    encflags:
+     # fix the size of the bounding box to align frames for predictive coding
+     - autoSeqBbox: 0
+     - seqOrigin: '-32768, -32768, -32768'
+     - seqSizeWhd: '65535, 65535, 65535'
+    pcerrorflags:
+     - resolution: 3000
+
+  innovizQC3:
+    global_motion_file: 'gps-innovizqc3-matrix.txt'
+    src-dir: InnovizQC3
+    src: '{0000..0299}.ply'
+    first-frame: 0
+    frame-rate: 15
+    num-frames: 300
+    group: cat3-frame
+    src-geometry-precision: 16
+    src-unit-metres: 0.01
+    lidar-type: non-spinning
+    seq_lod: 10
+    seq_lod_bias: '1,1,8'
+    has_refl: 1
+    bitdepth_refl: 8
+    encflags:
+     # fix the size of the bounding box to align frames for predictive coding
+     - autoSeqBbox: 0
+     - seqOrigin: '-32768, -32768, -32768'
+     - seqSizeWhd: '65535, 65535, 65535'
+    pcerrorflags:
+     - resolution: 3000

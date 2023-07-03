@@ -97,6 +97,12 @@ public:
     return std::abs(data[0]) + std::abs(data[1]) + std::abs(data[2]);
   }
 
+  T getDir() const
+  {
+    return ((data[0] >= 0 ? 1 : 0) << 2) + ((data[1] >= 0 ? 1 : 0) << 1)
+      + ((data[2] >= 0 ? 1 : 0));
+  }
+
   T getNormInf() const
   {
     return std::max(data[2], std::max(abs(data[0]), abs(data[1])));
@@ -595,6 +601,26 @@ mortonAddr(const int32_t x, const int32_t y, const int32_t z)
   return answer;
 }
 
+inline int64_t
+mortonAddr64(Vec3<int32_t> point)
+{ /*Theoretically, for r06, the smallest x/y/z of uppoint + delta is at least -1;  
+    for r05, the smallest x/y/z of uppoint + delta is at least -1*2-1=-3; 
+    for r0(7-K), the smallest x/y/z of uppoint + delta is at least -(2^K-1); ..., 
+    for r01 (K=6), the smallest x/y/z of uppoint + delta  is at least -(2^6-1)=-63. 
+    So 64 can theoretically ensure the assertion successed.*/
+  int x = int(point[0]) + 64;
+  int y = int(point[1]) + 64;
+  int z = int(point[2]) + 64;
+  assert(x >= 0 && y >= 0 && z >= 0);
+  int64_t answer = kMortonCode256X[(x >> 16) & 0xFF]
+    | kMortonCode256Y[(y >> 16) & 0xFF] | kMortonCode256Z[(z >> 16) & 0xFF];
+  answer = answer << 24 | kMortonCode256X[(x >> 8) & 0xFF]
+    | kMortonCode256Y[(y >> 8) & 0xFF] | kMortonCode256Z[(z >> 8) & 0xFF];
+  answer = answer << 24 | kMortonCode256X[x & 0xFF] | kMortonCode256Y[y & 0xFF]
+    | kMortonCode256Z[z & 0xFF];
+  return answer;
+}
+
 //---------------------------------------------------------------------------
 // Convert a vector position to morton order address.
 
@@ -678,6 +704,13 @@ divExp2RoundHalfInf(Vec3<T> vec, int shift)
   return vec;
 }
 
+//---------------------------------------------------------------------------
+inline int64_t
+divExp2RoundHalfInfPositiveShift(
+  const int64_t scalar, const unsigned int shift, const unsigned int s0)
+{
+  return scalar >= 0 ? (s0 + scalar) >> shift : -((s0 - scalar) >> shift);
+}
 //---------------------------------------------------------------------------
 
 extern const uint16_t kDivApproxDivisor[256];

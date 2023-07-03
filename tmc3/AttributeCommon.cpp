@@ -48,7 +48,9 @@ AttributeLods::generate(
   const AttributeBrickHeader& abh,
   int geom_num_points_minus1,
   int minGeomNodeSizeLog2,
-  const PCCPointSet3& cloud)
+  const PCCPointSet3& cloud
+  , const AttributeInterPredParams& attrInterPredParams  
+  )
 {
   _aps = aps;
   _abh = abh;
@@ -58,14 +60,18 @@ AttributeLods::generate(
 
   buildPredictorsFast(
     aps, abh, cloud, minGeomNodeSizeLog2, geom_num_points_minus1, predictors,
-    numPointsInLod, indexes);
+    numPointsInLod, indexes
+    ,
+    attrInterPredParams.enableAttrInterPred, attrInterPredParams,
+    numPointsInLodRef, indexesRef    
+    );
 
   assert(predictors.size() == cloud.getPointCount());
   for (auto& predictor : predictors) {
     predictor.computeWeights();
     if (aps.attr_encoding == AttributeEncoding::kPredictingTransform)
       if (aps.pred_weight_blending_enabled_flag)
-        predictor.blendWeights(cloud, indexes);
+        predictor.blendWeights(cloud, indexes, attrInterPredParams);
   }
 }
 
@@ -126,6 +132,10 @@ AttributeLods::isReusable(
     return false;
 
   if (
+    _aps.max_points_per_sort_log2_plus1 != aps.max_points_per_sort_log2_plus1)
+    return false;
+
+  if (
     _aps.pred_weight_blending_enabled_flag
     != aps.pred_weight_blending_enabled_flag)
     return false;
@@ -173,7 +183,8 @@ predModeEligibleRefl(
   const AttributeParameterSet& aps,
   const PCCPointSet3& pointCloud,
   const std::vector<uint32_t>& indexes,
-  const PCCPredictor& predictor)
+  const PCCPredictor& predictor
+  ,const AttributeInterPredParams& attrInterPredParams)
 {
   if (predictor.neighborCount <= 1 || !aps.max_num_direct_predictors)
     return false;
@@ -181,8 +192,15 @@ predModeEligibleRefl(
   int64_t minValue = 0;
   int64_t maxValue = 0;
   for (int i = 0; i < predictor.neighborCount; ++i) {
-    const attr_t reflectanceNeighbor = pointCloud.getReflectance(
-      indexes[predictor.neighbors[i].predictorIndex]);
+    const attr_t reflectanceNeighbor = attrInterPredParams.enableAttrInterPred
+      ? (predictor.neighbors[i].interFrameRef
+           ? attrInterPredParams.referencePointCloud
+           : pointCloud)
+          .getReflectance(predictor.neighbors[i].pointIndex)
+      : pointCloud.getReflectance(
+        indexes[predictor.neighbors[i].predictorIndex]);
+    //const attr_t reflectanceNeighbor = pointCloud.getReflectance(
+    //  indexes[predictor.neighbors[i].predictorIndex]);
     if (i == 0 || reflectanceNeighbor < minValue) {
       minValue = reflectanceNeighbor;
     }

@@ -70,7 +70,7 @@ namespace {
 //============================================================================
 
 namespace {
-  float estimate(bool bit, AdaptiveBitModel model)
+  float estimate(bool bit, AdaptiveBitModel& model)
   {
     return -log2(dirac::approxSymbolProbability(bit, model) / 128.);
   }
@@ -86,6 +86,7 @@ public:
   PredGeomEncoder(
     const GeometryParameterSet&,
     const GeometryBrickHeader&,
+    const PredGeomEncOpts&,
     const PredGeomContexts& ctxtMem,
     EntropyEncoder* aec);
 
@@ -98,7 +99,8 @@ public:
     Vec3<int32_t>* cloudB,
     const GNode* nodes,
     int numNodes,
-    int* codedOrder);
+    int* codedOrder,
+    PredGeomPredictor& refFrameSph);
 
   int encodeTree(
     Vec3<int32_t>* cloudA,
@@ -106,19 +108,52 @@ public:
     const GNode* nodes,
     int numNodes,
     int rootIdx,
-    int* codedOrder);
+    int* codedOrder,
+    PredGeomPredictor& refFrameSph);
 
   void encodeNumDuplicatePoints(int numDupPoints);
   void encodeNumChildren(int numChildren);
   void encodePredMode(GPredicter::Mode mode);
-  void encodeResidual(const Vec3<int32_t>& residual, int iMode);
+  void encodePredIdx(int predIdx);
+
+  void encodeResidual(const Vec3<int32_t>& residual, int iMode, int multiplier, int rPred, int predIdx, const bool interFlag);
+  void encodeResPhi(
+    int32_t resPhi, int predIdx, int boundPhi, const bool interFlag);
+  void
+  encodeResR(int32_t resR, int multiplier, int predIdx, const bool interFlag);
+
   void encodeResidual2(const Vec3<int32_t>& residual);
-  void encodePhiMultiplier(const int32_t multiplier);
+  void encodePhiMultiplier(const int32_t multiplier, const bool interFlag);
+  void encodeInterFlag(const bool interFlag, const uint8_t interFlagBuffer);
+  void encodeRefNodeFlag(bool refNodeFlag);
   void encodeQpOffset(int dqp);
   void encodeEndOfTreesFlag(int endFlag);
 
-  float
-  estimateBits(GPredicter::Mode mode, const Vec3<int32_t>& residual, int qphi);
+
+  template<size_t NumPrefixCtx, size_t NumSuffixCtx>
+  inline float
+  estimateExpGolomb(
+    unsigned int symbol,
+    int k,
+    AdaptiveBitModel (&ctxPrefix)[NumPrefixCtx],
+    AdaptiveBitModel (&ctxSuffix)[NumSuffixCtx]);
+
+  float estimateResPhi(int32_t resPhi, int predIdx, int boundPhi, const bool interFlag);
+
+  float estimateResR(
+    int32_t resR, int multiplier, int predIdx, const bool interFlag);
+
+  float estimateBits(
+    GPredicter::Mode mode,
+    int predIdx,
+    const Vec3<int32_t>& residual,
+    int qphi,
+    int rPred,
+    bool interFlag,
+    bool interEnabledFlag,
+    bool refNodeFlag,
+    const uint8_t interFlagBuffer,
+    float best_known_bits);
 
   const PredGeomContexts& getCtx() const { return *this; }
 
@@ -130,6 +165,7 @@ private:
   bool _geom_unique_points_flag;
 
   bool _geom_angular_mode_enabled_flag;
+  bool _predgeometry_residual2_disabling_enabled_flag;
   Vec3<int32_t> origin;
   int _numLasers;
   SphericalToCartesian _sphToCartesian;
@@ -148,6 +184,10 @@ private:
 
   // Minimum radius used for prediction in angular coding
   int _pgeom_min_radius;
+
+  int _maxPredIdx;
+  int _maxPredIdxTested;
+  int _thObj;
 };
 
 //============================================================================
@@ -155,12 +195,14 @@ private:
 PredGeomEncoder::PredGeomEncoder(
   const GeometryParameterSet& gps,
   const GeometryBrickHeader& gbh,
+  const PredGeomEncOpts& opt,
   const PredGeomContexts& ctxtMem,
   EntropyEncoder* aec)
   : PredGeomContexts(ctxtMem)
   , _aec(aec)
   , _geom_unique_points_flag(gps.geom_unique_points_flag)
   , _geom_angular_mode_enabled_flag(gps.geom_angular_mode_enabled_flag)
+  , _predgeometry_residual2_disabling_enabled_flag(gps.residual2_disabled_flag)
   , origin()
   , _numLasers(gps.numLasers())
   , _sphToCartesian(gps)
@@ -173,6 +215,9 @@ PredGeomEncoder::PredGeomEncoder(
   , _pgeom_resid_abs_log2_bits(gbh.pgeom_resid_abs_log2_bits)
   , _azimuthTwoPiLog2(gps.geom_angular_azimuth_scale_log2_minus11 + 12)
   , _pgeom_min_radius(gbh.pgeom_min_radius)
+  , _maxPredIdx(gps.predgeom_max_pred_index)
+  , _maxPredIdxTested(opt.maxPredIdxTested)
+  , _thObj(gps.predgeom_radius_threshold_for_pred_list)
 {
   if (gps.geom_scaling_enabled_flag) {
     _sliceQp = gbh.sliceQp(gps);
@@ -224,25 +269,197 @@ PredGeomEncoder::encodePredMode(GPredicter::Mode mode)
   _aec->encode(iMode & 1, _ctxPredMode[1 + (iMode >> 1)]);
 }
 
-//----------------------------------------------------------------------------
+//-------------------------------------------------------------------------
 
 void
-PredGeomEncoder::encodeResidual(const Vec3<int32_t>& residual, int iMode)
+PredGeomEncoder::encodePredIdx(int predIdx)
 {
-  for (int k = 0, ctxIdx = 0; k < 3; k++) {
+  for (int i = 0; i < predIdx; ++i)
+    _aec->encode(1, _ctxPredIdx[i]);
+  if (predIdx < _maxPredIdx)
+    _aec->encode(0, _ctxPredIdx[predIdx]);
+}
+//----------------------------------------------------------------------------
+void
+PredGeomEncoder::encodeResR(int32_t resR, int multiplier, int predIdx, const bool interFlag)
+{
+  const int interCtx = interFlag ? 1 : 0;
+  int ctxL = predIdx == 0 /* parent */;
+  int ctxLR = ctxL + (multiplier ? 2 : 0);
+
+  _aec->encode(resR != 0, _ctxResRGTZero[interCtx][ctxLR]);
+  if (!resR)
+    return;
+
+  int absVal = std::abs(resR);
+  _aec->encode(--absVal > 0, _ctxResRGTOne[interCtx][ctxLR]);
+  if (absVal)
+    _aec->encode(--absVal > 0, _ctxResRGTTwo[interCtx][ctxLR]);
+  if (absVal)
+    _aec->encodeExpGolomb(
+      absVal - 1, 2, _ctxResRExpGolombPre[interCtx][ctxLR],
+      _ctxResRExpGolombSuf[interCtx][ctxLR]);
+
+  int ctxR =
+    (_precAzimuthStepDelta ? 4 : 0) + (multiplier ? 2 : 0) + _precSignR;
+
+  _aec->encode(
+    resR < 0, _ctxResRSign[interCtx ? 2 : _prevInterFlag][ctxL][ctxR]);
+  _precSignR = resR < 0;
+  _precAzimuthStepDelta = multiplier;
+  _prevInterFlag = interFlag;
+}
+
+//-------------------------------------------------------------------------
+
+void
+PredGeomEncoder::encodeResPhi(
+  int32_t resPhi, int predIdx, int boundPhi, const bool interFlag)
+{
+  if (boundPhi == 0)
+    return;
+
+  int interCtxIdx = interFlag ? 1 : 0;
+  int ctxL = predIdx ? 1 : 0;
+
+  _aec->encode(resPhi != 0, _ctxResPhiGTZero[interCtxIdx][ctxL]);
+  if (!resPhi)
+    return;
+
+  int absVal = std::abs(resPhi);
+  if (boundPhi > 1)
+    _aec->encode(--absVal > 0, _ctxResPhiGTOne[interCtxIdx][ctxL]);
+  if (absVal && boundPhi > 2)
+    _aec->encodeExpGolomb(
+      absVal - 1, 1, _ctxResPhiExpGolombPre[interCtxIdx][boundPhi - 3 > 6],
+      _ctxResPhiExpGolombSuf[interCtxIdx][boundPhi - 3 > 6]);
+
+  _aec->encode(
+    resPhi < 0,
+    _ctxResPhiSign[interCtxIdx ? 0 : ctxL][interCtxIdx ? 3 : _resPhiOldSign]);
+  _resPhiOldSign = interFlag ? 2 : (resPhi < 0 ? 1 : 0);
+}
+
+//-------------------------------------------------------------------------
+
+template<size_t NumPrefixCtx, size_t NumSuffixCtx>
+inline float
+PredGeomEncoder::estimateExpGolomb(
+  unsigned int symbol,
+  int k,
+  AdaptiveBitModel (&ctxPrefix)[NumPrefixCtx],
+  AdaptiveBitModel (&ctxSuffix)[NumSuffixCtx])
+{
+  float bits=0;
+  constexpr int maxPrefixIdx = NumPrefixCtx - 1;
+  constexpr int maxSuffixIdx = NumSuffixCtx - 1;
+  const int k0 = k;
+
+  while (symbol >= (1u << k)) {
+    bits += estimate(1, ctxPrefix[std::min(maxPrefixIdx, k - k0)]);
+    symbol -= 1u << k;
+    k++;
+  }
+  bits += estimate(0, ctxPrefix[std::min(maxPrefixIdx, k - k0)]);
+
+  while (k--)
+    bits += estimate((symbol >> k) & 1, ctxSuffix[std::min(maxSuffixIdx, k)]);
+
+  return bits;
+}
+
+float
+PredGeomEncoder::estimateResPhi(
+  int32_t resPhi, int predIdx, int boundPhi, const bool interFlag)
+{
+  float bits = 0.;
+  int interCtxIdx = interFlag ? 1 : 0;
+
+  if (boundPhi == 0)
+    return bits;
+
+  int ctxL = predIdx ? 1 : 0;
+
+  bits += estimate(resPhi != 0, _ctxResPhiGTZero[interCtxIdx][ctxL]);
+  if (!resPhi)
+    return bits;
+
+  int absVal = std::abs(resPhi);
+  if (boundPhi > 1)
+    bits += estimate(--absVal > 0, _ctxResPhiGTOne[interCtxIdx][ctxL]);
+  if (absVal && boundPhi > 2)
+    bits += estimateExpGolomb(
+      absVal - 1, 1, _ctxResPhiExpGolombPre[interCtxIdx][boundPhi - 3 > 6],
+      _ctxResPhiExpGolombSuf[interCtxIdx][boundPhi - 3 > 6]);
+
+  bits += estimate(
+    resPhi < 0,
+    _ctxResPhiSign[interCtxIdx ? 0 : ctxL][interCtxIdx ? 3 : _resPhiOldSign]);
+
+  return bits;
+}
+
+//----------------------------------------------------------------------------
+float
+PredGeomEncoder::estimateResR(int32_t resR, int multiplier, int predIdx, const bool interFlag)
+{
+  const int interCtx = interFlag ? 1 : 0;
+  float bits = 0.;
+  int ctxL = predIdx == 0 /* parent */;
+  int ctxLR = ctxL + (multiplier ? 2 : 0);
+
+  bits += estimate(resR != 0, _ctxResRGTZero[interCtx][ctxLR]);
+  if (!resR)
+    return bits;
+
+  int absVal = std::abs(resR);
+  bits += estimate(--absVal > 0, _ctxResRGTOne[interCtx][ctxLR]);
+  if (absVal)
+    bits += estimate(--absVal > 0, _ctxResRGTTwo[interCtx][ctxLR]);
+  if (absVal)
+    // encode residual by expGolomb k=2
+    bits += std::max(3, (ilog2(uint32_t(absVal + 4)) << 1) - 1);
+
+  int ctxR =
+    (_precAzimuthStepDelta ? 4 : 0) + (multiplier ? 2 : 0) + _precSignR;
+
+  bits += estimate(
+    resR < 0, _ctxResRSign[interCtx ? 2 : _prevInterFlag][ctxL][ctxR]);
+  return bits;
+}
+
+//----------------------------------------------------------------------------
+void
+PredGeomEncoder::encodeResidual(const Vec3<int32_t>& residual, int iMode, int multiplier, int rPred, int predIdx, const bool interFlag)
+{
+  int interCtxIdx = interFlag ? 1 : 0;
+  int k = 0;
+
+  if (_azimuth_scaling_enabled_flag) {
+    // N.B. mode is always 1 with _azimuth_scaling_enabled_flag
+    encodeResR(residual[0], multiplier, predIdx, interFlag);
+
+    int r = rPred + residual[0] << 3;
+    auto speedTimesR = int64_t(_geomAngularAzimuthSpeed) * r;
+    int phiBound = divExp2RoundHalfInf(speedTimesR, _azimuthTwoPiLog2 + 1);
+    encodeResPhi(residual[1], predIdx, phiBound, interFlag);
+    k = 2;
+  }
+
+  for (int ctxIdx = 0; k < 3; k++) {
     // The last component (delta laseridx) isn't coded if there is one laser
     if (_geom_angular_mode_enabled_flag && _numLasers == 1 && k == 2)
       continue;
 
     const auto res = residual[k];
-    _aec->encode(res != 0, _ctxResGt0[k]);
+    _aec->encode(res != 0, _ctxResGt0[interCtxIdx][k]);
     if (!res)
       continue;
 
     int32_t value = abs(res) - 1;
     int32_t numBits = 1 + ilog2(uint32_t(value));
 
-    AdaptiveBitModel* ctxs = &_ctxNumBits[ctxIdx][k][0] - 1;
+    AdaptiveBitModel* ctxs = &_ctxNumBits[interCtxIdx][ctxIdx][k][0] - 1;
     for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
       auto bin = (numBits >> n) & 1;
       _aec->encode(bin, ctxs[ctxIdx]);
@@ -256,10 +473,12 @@ PredGeomEncoder::encodeResidual(const Vec3<int32_t>& residual, int iMode)
     for (int32_t i = 0; i < numBits; ++i)
       _aec->encode((value >> i) & 1);
 
-    if (iMode || k)
-      _aec->encode(res < 0, _ctxSign[k]);
+    if (iMode || k) {
+      _aec->encode(res < 0, _ctxSign[interCtxIdx][k]);
+    }
   }
 }
+
 
 //----------------------------------------------------------------------------
 
@@ -284,30 +503,49 @@ PredGeomEncoder::encodeResidual2(const Vec3<int32_t>& residual)
 //----------------------------------------------------------------------------
 
 void
-PredGeomEncoder::encodePhiMultiplier(int32_t multiplier)
+PredGeomEncoder::encodePhiMultiplier(int32_t multiplier, const bool interFlag)
 {
-  _aec->encode(multiplier != 0, _ctxPhiGtN[0]);
+  int interCtxIdx = interFlag ? 1 : 0;
+  _aec->encode(multiplier != 0, _ctxPhiGtN[interCtxIdx][0]);
   if (!multiplier)
     return;
 
   int32_t value = abs(multiplier) - 1;
-  _aec->encode(value > 0, _ctxPhiGtN[1]);
+  _aec->encode(value > 0, _ctxPhiGtN[interCtxIdx][1]);
   if (!value) {
-    _aec->encode(multiplier < 0, _ctxSignPhi);
+    _aec->encode(multiplier < 0, _ctxSignPhi[interCtxIdx]);
     return;
   }
 
   value--;
   int valueMinus7 = value - 7;
   value = std::min(value, 7);
-  _aec->encode((value >> 2) & 1, _ctxResidualPhi[0]);
-  _aec->encode((value >> 1) & 1, _ctxResidualPhi[1 + (value >> 2)]);
-  _aec->encode((value >> 0) & 1, _ctxResidualPhi[3 + (value >> 1)]);
+  _aec->encode((value >> 2) & 1, _ctxResidualPhi[interCtxIdx][0]);
+  _aec->encode(
+    (value >> 1) & 1, _ctxResidualPhi[interCtxIdx][1 + (value >> 2)]);
+  _aec->encode(
+    (value >> 0) & 1, _ctxResidualPhi[interCtxIdx][3 + (value >> 1)]);
 
   if (valueMinus7 >= 0)
-    _aec->encodeExpGolomb(valueMinus7, 0, _ctxEGPhi);
+    _aec->encodeExpGolomb(valueMinus7, 0, _ctxEGPhi[interCtxIdx]);
 
-  _aec->encode(multiplier < 0, _ctxSignPhi);
+  _aec->encode(multiplier < 0, _ctxSignPhi[interCtxIdx]);
+}
+//----------------------------------------------------------------------------
+void
+PredGeomEncoder::encodeInterFlag(bool interFlag, const uint8_t interFlagBuffer)
+{
+  uint8_t interFlagCtxIdx =
+    interFlagBuffer & PredGeomEncoder::interFlagBufferMask;
+  _aec->encode(interFlag, _ctxInterFlag[interFlagCtxIdx]);
+}
+
+//----------------------------------------------------------------------------
+
+void
+PredGeomEncoder::encodeRefNodeFlag(bool refNodeFlag)
+{
+  _aec->encode(refNodeFlag, _ctxRefNodeFlag);
 }
 
 //----------------------------------------------------------------------------
@@ -335,55 +573,110 @@ PredGeomEncoder::encodeEndOfTreesFlag(int end_of_trees_flag)
 
 float
 PredGeomEncoder::estimateBits(
-  GPredicter::Mode mode, const Vec3<int32_t>& residual, int multiplier)
+  GPredicter::Mode mode,
+  int predIdx,
+  const Vec3<int32_t>& residual,
+  int multiplier,
+  int rPred,
+  bool interFlag,
+  bool interEnabledFlag,
+  bool refNodeFlag,
+  const uint8_t interFlagBuffer,
+  float best_known_bits)
 {
   int iMode = int(mode);
   float bits = 0.;
-  bits += estimate((iMode >> 1) & 1, _ctxPredMode[0]);
-  bits += estimate(iMode & 1, _ctxPredMode[1 + (iMode >> 1)]);
+  int interCtxIdx = interFlag ? 1 : 0;
+  if (!interFlag) {
+    if (_azimuth_scaling_enabled_flag) {
+      for (int i = 0; i < predIdx; ++i)
+        bits += estimate(1, _ctxPredIdx[i]);
+      if (predIdx < _maxPredIdx)
+        bits += estimate(0, _ctxPredIdx[predIdx]);
+    } else {
+      bits += estimate((iMode >> 1) & 1, _ctxPredMode[0]);
+      bits += estimate(iMode & 1, _ctxPredMode[1 + (iMode >> 1)]);
+    }
+  } else {
+    bits += estimate(refNodeFlag, _ctxRefNodeFlag);
+  }
+  if (bits > best_known_bits)  return bits;
+
+  if (interEnabledFlag) {
+    uint8_t interFlagCtxIdx =
+      interFlagBuffer & PredGeomEncoder::interFlagBufferMask;
+    bits += estimate(interFlag, _ctxInterFlag[interFlagCtxIdx]);
+    if (bits > best_known_bits)  return bits;
+  }
 
   if (_geom_angular_mode_enabled_flag) {
-    bits += estimate(multiplier != 0, _ctxPhiGtN[0]);
+    bits += estimate(multiplier != 0, _ctxPhiGtN[interCtxIdx][0]);
+    if (bits > best_known_bits)  return bits;
 
     if (multiplier) {
       int32_t value = abs(multiplier) - 1;
-      bits += estimate(value > 0, _ctxPhiGtN[1]);
-      bits += estimate(multiplier < 0, _ctxSignPhi);
+      bits += estimate(value > 0, _ctxPhiGtN[interCtxIdx][1]);
+      bits += estimate(multiplier < 0, _ctxSignPhi[interCtxIdx]);
+      if (bits > best_known_bits)  return bits;
       if (value) {
         value--;
 
         int valueMinus7 = value - 7;
         value = std::min(value, 7);
-        bits += estimate((value >> 2) & 1, _ctxResidualPhi[0]);
-        bits += estimate((value >> 1) & 1, _ctxResidualPhi[1 + (value >> 2)]);
-        bits += estimate((value >> 0) & 1, _ctxResidualPhi[3 + (value >> 1)]);
+        bits += estimate((value >> 2) & 1, _ctxResidualPhi[interCtxIdx][0]);
+        bits += estimate(
+          (value >> 1) & 1, _ctxResidualPhi[interCtxIdx][1 + (value >> 2)]);
+        bits += estimate(
+          (value >> 0) & 1, _ctxResidualPhi[interCtxIdx][3 + (value >> 1)]);
 
         if (valueMinus7 >= 0)
           bits += (1 + 2.0 * log2(valueMinus7 + 1));
+        if (bits > best_known_bits)  return bits;
       }
     }
   }
 
-  for (int k = 0, ctxIdx = 0; k < 3; k++) {
+  int k = 0;
+
+  if (_azimuth_scaling_enabled_flag) {
+
+    bits += estimateResR(residual[0], multiplier, predIdx, interFlag);
+    if (bits > best_known_bits)  return bits;
+
+    int r = rPred + residual[0] << 3;
+    auto speedTimesR = int64_t(_geomAngularAzimuthSpeed) * r;
+    int phiBound = divExp2RoundHalfInf(speedTimesR, _azimuthTwoPiLog2 + 1);
+    bits += estimateResPhi(residual[1], predIdx, phiBound, interFlag);
+    if (bits > best_known_bits)  return bits;
+
+    k = 2;
+  }
+
+  for (int ctxIdx = 0; k < 3; k++) {
     // The last component (delta laseridx) isn't coded if there is one laser
     if (_geom_angular_mode_enabled_flag && _numLasers == 1 && k == 2)
       continue;
 
     const auto res = residual[k];
-    bits += estimate(res != 0, _ctxResGt0[k]);
+    bits += estimate(res != 0, _ctxResGt0[interCtxIdx][k]);
+    if (bits > best_known_bits)  return bits;
     if (res == 0)
       continue;
 
-    if (iMode > 0 || k)
-      bits += estimate(res < 0, _ctxSign[k]);
+    if (iMode > 0 || k) {
+      bits += estimate(res < 0, _ctxSign[interCtxIdx][k]);
+      if (bits > best_known_bits)  return bits;
+
+    }
 
     int32_t value = abs(res) - 1;
     int32_t numBits = 1 + ilog2(uint32_t(value));
 
-    AdaptiveBitModel* ctxs = &_ctxNumBits[ctxIdx][k][0] - 1;
+    AdaptiveBitModel* ctxs = &_ctxNumBits[interCtxIdx][ctxIdx][k][0] - 1;
     for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
       auto bin = (numBits >> n) & 1;
       bits += estimate(bin, ctxs[ctxIdx]);
+      if (bits > best_known_bits)  return bits;
       ctxIdx = (ctxIdx << 1) | bin;
     }
 
@@ -391,8 +684,8 @@ PredGeomEncoder::estimateBits(
       ctxIdx = std::min(4, (numBits + 1) >> 1);
 
     bits += std::max(0, numBits - 1);
+    if (bits > best_known_bits)  return bits;
   }
-
   return bits;
 }
 
@@ -405,26 +698,42 @@ PredGeomEncoder::encodeTree(
   const GNode* nodes,
   int numNodes,
   int rootIdx,
-  int* codedOrder)
+  int* codedOrder,
+  PredGeomPredictor& refFrameSph)
 {
   QuantizerGeom quantizer(_sliceQp);
   int nodesUntilQpOffset = 0;
   int processedNodes = 0;
+  int prevNodeIdx = -1;
+  int nodeCount = 0;
+  uint8_t interFlagBuffer = 0;
 
   _stack.push_back(rootIdx);
+
+  const int MaxNPred = kPTEMaxPredictorIndex + 1;
+  const int NPred = _maxPredIdx + 1;
+  const int NTestedPred = _maxPredIdxTested + 1;
+
+  std::array<std::array<int, 2>, MaxNPred> preds = {};
+
   while (!_stack.empty()) {
     const auto nodeIdx = _stack.back();
     _stack.pop_back();
+    auto curNodeIdx = nodeCount++;
 
     const auto& node = nodes[nodeIdx];
     const auto& point = srcPts[nodeIdx];
 
     struct {
-      float bits;
+      float bits = bits = std::numeric_limits<float>::max();
       GPredicter::Mode mode;
+      int predIdx;
       Vec3<int32_t> residual;
       Vec3<int32_t> prediction;
       int qphi;
+      bool interFlag;
+      bool refNodeFlag = false;
+      uint8_t interFlagBuffer;
     } best;
 
     if (_geom_scaling_enabled_flag && !nodesUntilQpOffset--) {
@@ -434,71 +743,168 @@ PredGeomEncoder::encodeTree(
       nodesUntilQpOffset = _qpOffsetInterval;
     }
 
+    bool isInterEnabled = refFrameSph.isInterEnabled() && (prevNodeIdx >= 0);
+
     // mode decision to pick best prediction from available set
     int qphi = 0;
+    auto azimuthSpeed = _geomAngularAzimuthSpeed;
     std::bitset<4> unusable;
-    for (int iMode = 0; iMode < 4; iMode++) {
-      GPredicter::Mode mode = GPredicter::Mode(iMode);
-      GPredicter predicter =
-        makePredicter(nodeIdx, mode, _pgeom_min_radius, [=](int idx) {
-          return nodes[idx].parent;
-        });
 
-      if (!predicter.isValid(mode))
-        continue;
+    const int iModeBegin = _azimuth_scaling_enabled_flag ? 1 : 0;
+    const int iModeEnd = _azimuth_scaling_enabled_flag ? 2 : 4;
+    const int predIdxEnd = _azimuth_scaling_enabled_flag ? NTestedPred : 1;
+    bool firstCheck = true;
 
-      auto pred =
-        predicter.predict(&srcPts[0], mode, _geom_angular_mode_enabled_flag);
-      if (_geom_angular_mode_enabled_flag) {
-        int32_t phi0 = pred[1];
-        int32_t phi1 = point[1];
-        int32_t deltaPhi = phi1 - phi0;
-        qphi = deltaPhi >= 0 ? (deltaPhi + (_geomAngularAzimuthSpeed >> 1))
-            / _geomAngularAzimuthSpeed
-                             : -(-deltaPhi + (_geomAngularAzimuthSpeed >> 1))
-            / _geomAngularAzimuthSpeed;
-        pred[1] += qphi * _geomAngularAzimuthSpeed;
-      }
+    for (int iMode = iModeBegin; iMode < iModeEnd; iMode++) {
+      for (int predIdx = 0; predIdx < predIdxEnd; ++predIdx) {
+        GPredicter::Mode mode = GPredicter::Mode(iMode);
+        GPredicter predicter =
+          makePredicter(nodeIdx, mode, _pgeom_min_radius, [=](int idx) {
+            return nodes[idx].parent;
+          });
 
-      auto residual = point - pred;
-      if (!_geom_angular_mode_enabled_flag)
-        for (int k = 0; k < 3; k++)
-          residual[k] = int32_t(quantizer.quantize(residual[k]));
-      else {
-        if (_azimuth_scaling_enabled_flag) {
-          // Quantize phi by 8r/2^n
-          auto arc = int64_t(residual[1]) * (pred[0] + residual[0]) << 3;
-          residual[1] = int32_t(divExp2RoundHalfInf(arc, _azimuthTwoPiLog2));
-        }
-      }
-
-      // Check if the prediction residual can be represented with the
-      // current configuration.  If it can't, don't use this mode.
-      for (int k = 0; k < 3; k++) {
-        if (residual[k])
-          if ((abs(residual[k]) - 1) >> _maxAbsResidualMinus1Log2[k])
-            unusable[iMode] = true;
-      }
-
-      if (unusable[iMode]) {
-        if (iMode == 3 && unusable.all())
-          throw std::runtime_error(
-            "predgeom: can't represent residual in any mode");
-        if (iMode > 0)
+        if (!_azimuth_scaling_enabled_flag && !predicter.isValid(mode))
           continue;
-      }
+        for (auto interFlag = 0; interFlag < (isInterEnabled ? 3 : 1);
+             interFlag++) {
+          point_t pred = 0;
+          bool refNodeFlag = false;
+          if (!interFlag) {
+            pred = predicter.predict(
+              &srcPts[0], mode, _geom_angular_mode_enabled_flag);
 
-      // penalize bit cost so that it is only used if all modes overfow
-      auto bits = estimateBits(mode, residual, qphi);
-      if (unusable[iMode])
-        bits = std::numeric_limits<decltype(bits)>::max();
+            if (_azimuth_scaling_enabled_flag && predIdx > 0) {
+              pred[0] = preds[predIdx][0];
+              auto deltaPhi = pred[1] - preds[predIdx][1];
+              pred[1] = preds[predIdx][1];
+              if (
+                deltaPhi >= _geomAngularAzimuthSpeed
+                || deltaPhi <= -_geomAngularAzimuthSpeed) {
+                int qphi0 =
+                  divApprox(int64_t(deltaPhi), _geomAngularAzimuthSpeed, 0);
+                pred[1] += qphi0 * _geomAngularAzimuthSpeed;
+              }
+            }
+          } else {
+            if (_azimuth_scaling_enabled_flag ? predIdx : iMode)
+              continue;
+            auto prevPos = srcPts[prevNodeIdx];
+            std::pair<bool, point_t> interPred;
+            switch (interFlag) {
+            case 1:
+              interPred = refFrameSph.getClosestPred(prevPos[1], prevPos[2]);
+              refNodeFlag = false;
+              break;
+            case 2:
+              interPred =
+                refFrameSph.getNextClosestPred(prevPos[1], prevPos[2]);
+              refNodeFlag = true;
+              break;
+            default:
+              std::cerr << "Unknown option; skipping encoder check.\n";
+              continue;
+              break;
+            }
+            if (interPred.first)
+              pred = interPred.second;
+            else
+              continue;
+          }
+          auto residual = point - pred;
+          if (!_geom_angular_mode_enabled_flag)
+            for (int k = 0; k < 3; k++)
+              residual[k] = int32_t(quantizer.quantize(residual[k]));
+          else {
+            while (residual[1] < -1 << (_azimuthTwoPiLog2 - 1))
+              residual[1] += (1 << _azimuthTwoPiLog2);
+            while (residual[1] >= 1 << (_azimuthTwoPiLog2 - 1))
+              residual[1] -= (1 << _azimuthTwoPiLog2);
 
-      if (iMode == 0 || bits < best.bits) {
-        best.prediction = pred;
-        best.residual = residual;
-        best.mode = mode;
-        best.bits = bits;
-        best.qphi = qphi;
+            if (_azimuth_scaling_enabled_flag) {
+              // Quantize phi by 8r/2^n
+              auto r = (pred[0] + residual[0]) << 3;
+
+              azimuthSpeed = _geomAngularAzimuthSpeed;
+              qphi = 0;
+              auto speedTimesR = int64_t(azimuthSpeed) * r;
+              int phiBound =
+                divExp2RoundHalfInf(speedTimesR, _azimuthTwoPiLog2 + 1);
+              if (r) {
+                if (!phiBound) {
+                  const int32_t pi = 1 << (_azimuthTwoPiLog2 - 1);
+                  int32_t speedTimesR32 = speedTimesR;
+                  while (speedTimesR32 < pi) {
+                    speedTimesR32 <<= 1;
+                    azimuthSpeed <<= 1;
+                  }
+                }
+                qphi = residual[1] >= 0
+                  ? (residual[1] + (azimuthSpeed >> 1)) / azimuthSpeed
+                  : -(-residual[1] + (azimuthSpeed >> 1)) / azimuthSpeed;
+                pred[1] += qphi * azimuthSpeed;
+                residual[1] = point[1] - pred[1];
+                while (residual[1] < -1 << (_azimuthTwoPiLog2 - 1))
+                  residual[1] += (1 << _azimuthTwoPiLog2);
+                while (residual[1] >= 1 << (_azimuthTwoPiLog2 - 1))
+                  residual[1] -= (1 << _azimuthTwoPiLog2);
+              }
+
+              auto arc = int64_t(residual[1]) * r;
+              residual[1] =
+                int32_t(divExp2RoundHalfInf(arc, _azimuthTwoPiLog2));
+              if (residual[1] < -phiBound)
+                residual[1] = -phiBound;
+              if (residual[1] > phiBound)
+                residual[1] = phiBound;
+              // lossless encoding of theta index
+            } else {
+              // The residual in the spherical domain is losslessly coded
+              qphi = residual[1] >= 0
+                ? (residual[1] + (_geomAngularAzimuthSpeed >> 1))
+                  / _geomAngularAzimuthSpeed
+                : -(-residual[1] + (_geomAngularAzimuthSpeed >> 1))
+                  / _geomAngularAzimuthSpeed;
+              pred[1] += qphi * _geomAngularAzimuthSpeed;
+              residual[1] = point[1] - pred[1];
+            }
+          }
+
+          // Check if the prediction residual can be represented with the
+          // current configuration.  If it can't, don't use this mode.
+          for (int k = 0; k < 3; k++) {
+            if (residual[k])
+              if ((abs(residual[k]) - 1) >> _maxAbsResidualMinus1Log2[k])
+                unusable[iMode] = true;
+          }
+
+          if (unusable[iMode]) {
+            if (iMode == 3 && unusable.all())
+              throw std::runtime_error(
+                "predgeom: can't represent residual in any mode");
+            if (iMode > 0)
+              continue;
+          }
+
+          // penalize bit cost so that it is only used if all modes overfow
+          auto bits = estimateBits(
+            mode, predIdx, residual, qphi, pred[0], interFlag, isInterEnabled,
+            refNodeFlag, interFlagBuffer, best.bits);
+
+          if (unusable[iMode])
+            bits = std::numeric_limits<decltype(bits)>::max();
+
+          if (firstCheck || bits < best.bits) {
+            best.prediction = pred;
+            best.predIdx = predIdx;
+            best.residual = residual;
+            best.mode = mode;
+            best.bits = bits;
+            best.qphi = qphi;
+            best.interFlag = interFlag;
+            firstCheck = false;
+            best.refNodeFlag = refNodeFlag;
+          }
+        }
       }
     }
 
@@ -506,12 +912,23 @@ PredGeomEncoder::encodeTree(
     if (!_geom_unique_points_flag)
       encodeNumDuplicatePoints(node.numDups);
     encodeNumChildren(node.childrenCount);
-    encodePredMode(best.mode);
+    if (isInterEnabled)
+      encodeInterFlag(best.interFlag, interFlagBuffer);
+    if (best.interFlag)
+      encodeRefNodeFlag(best.refNodeFlag);
+    else {
+      if (_azimuth_scaling_enabled_flag)
+        encodePredIdx(best.predIdx);
+      else
+        encodePredMode(best.mode);
+    }
 
     if (_geom_angular_mode_enabled_flag)
-      encodePhiMultiplier(best.qphi);
+      encodePhiMultiplier(best.qphi, best.interFlag);
 
-    encodeResidual(best.residual, best.mode);
+    encodeResidual(
+      best.residual, best.mode, best.qphi, best.prediction[0], best.predIdx,
+      best.interFlag);
 
     // convert spherical prediction to cartesian and re-calculate residual
     if (_geom_angular_mode_enabled_flag) {
@@ -529,16 +946,33 @@ PredGeomEncoder::encodeTree(
         // update original spherical position with reconstructed spherical
         // position, for use in, for instance, attribute coding.
         srcPts[nodeIdx] /* == point */ = best.prediction + best.residual;
+        if (srcPts[nodeIdx][1] < -1 << (_azimuthTwoPiLog2 - 1))
+          srcPts[nodeIdx][1] += (1 << _azimuthTwoPiLog2);
+        if (srcPts[nodeIdx][1] >= 1 << (_azimuthTwoPiLog2 - 1))
+          srcPts[nodeIdx][1] -= (1 << _azimuthTwoPiLog2);
         for (int i = 1; i <= node.numDups; i++)
           srcPts[nodeIdx + i] = srcPts[nodeIdx];
+
+        bool flagNewObject = (best.interFlag ? std::abs(point[0] - preds[0][0])
+                                             : std::abs(best.residual[0]))
+          > _thObj;
+
+        int predIdx = flagNewObject ? NPred - 1 : best.predIdx;
+        for (int i = predIdx; i > 0; i--)
+          preds[i] = preds[i - 1];
+        preds[0][0] = srcPts[nodeIdx][0];
+        preds[0][1] = srcPts[nodeIdx][1];
       }
 
       best.prediction = origin + _sphToCartesian(point);
       best.residual = reconPts[nodeIdx] - best.prediction;
       for (int k = 0; k < 3; k++)
         best.residual[k] = int32_t(quantizer.quantize(best.residual[k]));
-
-      encodeResidual2(best.residual);
+      if (!_predgeometry_residual2_disabling_enabled_flag) {
+        encodeResidual2(best.residual);
+      } else {
+        best.residual = 0;
+      }
     }
 
     // write the reconstructed position back to the point cloud
@@ -555,9 +989,19 @@ PredGeomEncoder::encodeTree(
     for (int i = 1; i <= node.numDups; i++)
       codedOrder[processedNodes++] = nodeIdx + i;
 
+    if (_geom_angular_mode_enabled_flag) {
+      // duplicated points must be updated with unquantized value
+      // for attributes coding
+      for (int i = 1; i <= node.numDups; i++)
+        srcPts[nodeIdx + i] = srcPts[nodeIdx];
+    }
+
     for (int i = 0; i < node.childrenCount; i++) {
       _stack.push_back(node.children[i]);
     }
+
+    prevNodeIdx = nodeIdx;
+    interFlagBuffer = (interFlagBuffer << 1) | (best.interFlag ? 1 : 0);
   }
 
   return processedNodes;
@@ -571,7 +1015,8 @@ PredGeomEncoder::encode(
   Vec3<int32_t>* cloudB,
   const GNode* nodes,
   int numNodes,
-  int32_t* codedOrder)
+  int32_t* codedOrder,
+  PredGeomPredictor& refFrameSph)
 {
   int32_t processedNodes = 0;
   for (int32_t rootIdx = 0; rootIdx < numNodes; rootIdx++) {
@@ -580,7 +1025,8 @@ PredGeomEncoder::encode(
       continue;
 
     int numSubtreeNodes = encodeTree(
-      cloudA, cloudB, nodes, numNodes, rootIdx, codedOrder + processedNodes);
+      cloudA, cloudB, nodes, numNodes, rootIdx, codedOrder + processedNodes,
+      refFrameSph);
     processedNodes += numSubtreeNodes;
 
     // NB: this is just in case this call to encode needs to encode an
@@ -787,7 +1233,7 @@ mortonSort(PCCPointSet3& cloud, int begin, int end, int depth)
 Vec3<int>
 originFromLaserAngle(const PCCPointSet3& cloud)
 {
-  Vec3<int> origin;
+  Vec3<int> origin = 0;
   auto numPoints = cloud.getPointCount();
   int i;
 
@@ -818,6 +1264,7 @@ encodePredictiveGeometry(
   GeometryBrickHeader& gbh,
   PCCPointSet3& cloud,
   std::vector<point_t>* reconPosSph,
+  PredGeomPredictor& refFrameSph,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder)
 {
@@ -894,8 +1341,10 @@ encodePredictiveGeometry(
 
   // determine each geometry tree, and encode.  Size of trees is limited
   // by maxPtsPerTree.
-  PredGeomEncoder enc(gps, gbh, ctxtMem, arithmeticEncoder);
+  PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder);
   int maxPtsPerTree = std::min(opt.maxPtsPerTree, int(numPoints));
+  refFrameSph.init(
+    gps.interAzimScaleLog2, gps.numLasers(), gps.globalMotionEnabled);
 
   for (int i = 0; i < numPoints;) {
     int iEnd = std::min(i + maxPtsPerTree, int(numPoints));
@@ -936,7 +1385,7 @@ encodePredictiveGeometry(
 
     if (i > 0)
       enc.encodeEndOfTreesFlag(false);
-    enc.encode(a, b, nodes.data(), nodes.size(), codedOrder.data() + i);
+    enc.encode(a, b, nodes.data(), nodes.size(), codedOrder.data() + i, refFrameSph);
 
     // put points in output cloud in decoded order
     for (auto iBegin = i; i < iEnd; i++) {

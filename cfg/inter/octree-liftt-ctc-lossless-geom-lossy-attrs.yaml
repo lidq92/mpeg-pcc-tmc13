@@ -1,0 +1,197 @@
+# Test conditions for N17995 CTC C1 using TMC13 octree
+# octree lossless-geom  --  lossy-attrs liftt
+---
+categories:
+  lossless-geom-lossy-attrs:
+    encflags:
+     - mode: 0
+
+     -
+       - !conditional '${src-unit-metres}'
+       - srcUnit: metre
+       - srcUnitLength: '${src-unit-metres}'
+       - outputUnitLength: '${src-unit-metres}'
+
+     ##
+     # geometry parameters (octree)
+     #  - preserve lossless geometry property
+     - trisoupNodeSizeLog2: 0
+     - mergeDuplicatedPoints: 0
+     - neighbourAvailBoundaryLog2: 8
+     - intra_pred_max_node_size_log2: 6
+     - positionQuantizationScale: 1
+     - randomAccessPeriod: 32
+     - interPredictionEnabled: 1
+     - globalMotionEnabled: 1
+     - motionVectorPath: '${global_motion_file}'
+     -
+       - !conditional '${numLasers}'
+       - angularEnabled: 1
+       - numLasers: '${numLasers}'
+       - lasersTheta: '${lasersTheta}'
+       - lasersZ: '${lasersZ}'
+       - lasersNumPhiPerTurn:  '${lasersNumPhiPerTurn}'
+       - planarBufferDisabled: 1
+
+     # idcm intensity depends upon the content type
+     - inferredDirectCodingMode: 1
+     -
+       - !conditional '"${group}" eq "cat3-fused"'
+       - inferredDirectCodingMode: 2
+     -
+       - !conditional '"${group}" eq "cat3-frame"'
+       - inferredDirectCodingMode: 3
+
+     # default qtbt and planar with cat3-frame exception
+     - maxNumQtBtBeforeOt: 4
+     - minQtbtSizeLog2: 0
+     - planarEnabled: 1
+     -
+       - !conditional '"${group}" eq "solid"'
+       - planarEnabled: '${enablePlanar}'
+     -
+       - !conditional '"${group}" eq "dense"'
+       - planarEnabled: '${enablePlanar}'
+     - planarModeIdcmUse: 0
+     -
+       - !conditional '"${group}" eq "cat3-frame"'
+       - partitionMethod: 0
+       - maxNumQtBtBeforeOt: 6
+       - planarModeIdcmUse: 32
+     - gmThresholdHistScale: '$eval{ ${gm-thresh-hist-scale} || 100 }'
+     - gmThresholdMinZ: '$eval{ ${gm-thresh-min-z} || -4000 }'
+     - gmThresholdMaxZ: '$eval{ ${gm-thresh-max-z} || -500 }'
+     - gmThresholdLeftScale: '$eval{ ${gm-thresh-left-scale} || 1.5 }'
+     - gmThresholdRightScale: '$eval{ ${gm-thresh-right-scale} || 1.5 }'
+
+     ####
+     # attribute coding (common options -- relies on option ordering)
+     #  - use lifting transform for lossy conditions
+     #  - scale 16bit reflectance data to 8bit
+     - convertPlyColourspace: 1
+     - transformType: 2
+     - numberOfNearestNeighborsInPrediction: 3
+     - levelOfDetailCount: '$eval{ ${seq_lod} || 12 }'
+     - lodDecimator: 0
+     -
+       - !conditional '"${group}" =~ m{^cat3}'
+       - lodDecimator: 1
+       - lod_neigh_bias: ${seq_lod_bias}
+     -
+       - !conditional '"${group}" eq "cat3-fused"'
+       - lodDecimator: 2
+     -
+       - !conditional '${numLasers}'
+       - lod_neigh_bias: '1,1,1'
+       - spherical_coord_flag: 1
+
+     ##
+     # attribute coding -- reflectance
+     -
+       - !conditional '${has_refl}'
+       - adaptivePredictionThreshold: 64
+       - qp:
+           r01: 51
+           r02: 46
+           r03: 40
+           r04: 34
+           r05: 28
+           r06: 22
+       - bitdepth: 8
+       -
+         - !conditional '${reflectance8b16b_scale_factor}'
+         - attrOffset: 0
+         - attrScale: ${reflectance8b16b_scale_factor}
+       - attribute: reflectance
+
+     ##
+     # attribute coding -- colour
+     -
+       - !conditional '${has_colour}'
+       - adaptivePredictionThreshold: 64
+       - qp:
+           r01: 51
+           r02: 46
+           r03: 40
+           r04: 34
+           r05: 28
+           r06: 22
+       - qpChromaOffset: 0
+       - bitdepth: 8
+       - attrOffset: 0
+       - attrScale: 1
+       - attribute: color
+     - attrInterPredTranslationThresh: '$eval{ ${translation-thresh} || 1000 }'
+
+    decflags:
+     - mode: 1
+     -
+       - !conditional '${src-unit-metres}'
+       - outputUnitLength: '${src-unit-metres}'
+
+     - convertPlyColourspace: 1
+
+    pcerrorflags:
+     - dropdups: 2
+     - neighborsProc: 1
+
+    sequences:
+      # cat3
+      ford_01_q1mm:
+        # todo(??): it would be nice if the encoder could make this adjustment
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+
+      ford_02_q1mm:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+
+      ford_03_q1mm:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+
+      qnxadas-junction-approach:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+
+      qnxadas-junction-exit:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+
+      qnxadas-motorway-join:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+
+      qnxadas-navigating-bends:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+
+      innovizQC1:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+        translation-thresh: 100
+        gm-thresh-hist-scale: 10
+        gm-thresh-min-z: -250
+        gm-thresh-max-z: 250
+        gm-thresh-left-scale: 0.2
+        gm-thresh-right-scale: 0.5
+
+      innovizQC2:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+        translation-thresh: 100
+        gm-thresh-hist-scale: 10
+        gm-thresh-min-z: -250
+        gm-thresh-max-z: 250
+        gm-thresh-left-scale: 0.2
+        gm-thresh-right-scale: 0.5
+
+      innovizQC3:
+        # override dist2 at particular rate points (lossy geometry only)
+        seq_lod: { r01: 8, r02: 9 }
+        translation-thresh: 100
+        gm-thresh-hist-scale: 10
+        gm-thresh-min-z: -250
+        gm-thresh-max-z: 250
+        gm-thresh-left-scale: 0.2
+        gm-thresh-right-scale: 0.5
